@@ -320,7 +320,7 @@ class CaptureService : Service() {
     }
 
     private fun showOverlay() {
-        val size = 68.dp
+        val size = 56.dp
         val container = FrameLayout(this).apply {
             contentDescription = "擷取目前畫面"
             background = GradientDrawable().apply {
@@ -333,7 +333,7 @@ class CaptureService : Service() {
             setImageResource(R.drawable.ic_capture)
             contentDescription = null
             scaleType = ImageView.ScaleType.CENTER_INSIDE
-            setPadding(15.dp, 15.dp, 15.dp, 15.dp)
+            setPadding(12.dp, 12.dp, 12.dp, 12.dp)
         }
         container.addView(camera, FrameLayout.LayoutParams(-1, -1))
         container.addView(
@@ -342,13 +342,13 @@ class CaptureService : Service() {
                 text = "0"
                 gravity = Gravity.CENTER
                 setTextColor(Color.WHITE)
-                textSize = 12f
+                textSize = 11f
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.OVAL
                     setColor(Color.rgb(25, 25, 22))
                 }
             },
-            FrameLayout.LayoutParams(24.dp, 24.dp, Gravity.TOP or Gravity.END),
+            FrameLayout.LayoutParams(20.dp, 20.dp, Gravity.TOP or Gravity.END),
         )
 
         val bounds = screenBounds()

@@ -33,6 +33,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Typography
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -47,10 +48,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 
-private val Paper = Color(0xFFF7F7F5)
-private val Ink = Color(0xFF20201E)
-private val Accent = Color(0xFFC63C22)
-private val Quiet = Color(0xFF65635E)
+private val Paper = Color(0xFF111310)
+private val Ink = Color(0xFFF2F0E9)
+private val Accent = Color(0xFFFF7353)
+private val Quiet = Color(0xFFAAA9A2)
 
 private enum class PermissionStep { Overlay, Notification, Projection }
 
@@ -280,7 +281,7 @@ private fun PermissionScreen(step: PermissionStep, notificationDenied: Boolean, 
             onClick = onContinue,
             modifier = Modifier.fillMaxWidth().height(52.dp),
             shape = RoundedCornerShape(10.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = Accent),
+            colors = ButtonDefaults.buttonColors(containerColor = Ink),
         ) { Text(button, fontWeight = FontWeight.SemiBold) }
     }
 }
@@ -401,11 +402,17 @@ private fun AppHeader(status: String) {
 @Composable
 private fun LongScreenshotTheme(content: @Composable () -> Unit) {
     MaterialTheme(
-        colorScheme = MaterialTheme.colorScheme.copy(
+        colorScheme = darkColorScheme(
             primary = Accent,
+            onPrimary = Paper,
             background = Paper,
+            onBackground = Ink,
             surface = Paper,
             onSurface = Ink,
+            surfaceVariant = Color(0xFF20231E),
+            onSurfaceVariant = Quiet,
+            outline = Color(0xFF464942),
+            error = Accent,
         ),
         typography = Typography(
             titleLarge = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 20.sp, lineHeight = 26.sp),
