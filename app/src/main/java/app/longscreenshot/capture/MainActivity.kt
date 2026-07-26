@@ -4,6 +4,8 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -14,8 +16,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -23,10 +27,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -37,16 +44,22 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 private val Paper = Color(0xFF111310)
 private val Ink = Color(0xFFF2F0E9)
@@ -61,6 +74,8 @@ class MainActivity : ComponentActivity() {
     private var notificationDenied by mutableStateOf(false)
     private var homeMessage by mutableStateOf<String?>(null)
     private var showCancelDialog by mutableStateOf(false)
+    private var outputBusy by mutableStateOf(false)
+    private var outputMessage by mutableStateOf<String?>(null)
 
     private lateinit var overlayLauncher: ActivityResultLauncher<Intent>
     private lateinit var notificationLauncher: ActivityResultLauncher<String>
@@ -72,6 +87,9 @@ class MainActivity : ComponentActivity() {
 
         if (!CaptureSession.cleanOrphans(this)) {
             homeMessage = "部分舊暫存無法清除，請稍後再試。"
+        }
+        if (!CaptureOutput.cleanExpiredShares(this)) {
+            homeMessage = "部分過期剪貼簿圖片無法清除，請稍後再試。"
         }
 
         overlayLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
@@ -106,15 +124,21 @@ class MainActivity : ComponentActivity() {
                     homeMessage = homeMessage,
                     onStart = {
                         homeMessage = null
+                        outputMessage = null
                         notificationAsked = false
                         continuePermissionFlow()
                     },
                     onPermission = ::requestCurrentPermission,
                     onFinish = { startService(CaptureService.actionIntent(this, CaptureService.ACTION_FINISH)) },
                     onCancel = { showCancelDialog = true },
-                    onDestroyFinished = {
-                        if (!CaptureSession.destroy()) homeMessage = "暫存刪除失敗，尚未宣稱銷毀。"
-                    },
+                    outputBusy = outputBusy,
+                    outputMessage = outputMessage,
+                    onSave = { format -> runOutput("已存到相簿", format) {
+                        CaptureOutput.saveToGallery(this, CaptureSession.sourceFile(1), format)
+                    } },
+                    onCopy = { format -> runOutput("已複製到剪貼簿", format) {
+                        CaptureOutput.copyToClipboard(this, CaptureSession.sourceFile(1), format)
+                    } },
                 )
                 if (showCancelDialog) {
                     AlertDialog(
@@ -124,7 +148,17 @@ class MainActivity : ComponentActivity() {
                         confirmButton = {
                             TextButton(onClick = {
                                 showCancelDialog = false
-                                startService(CaptureService.actionIntent(this, CaptureService.ACTION_CANCEL))
+                                when (CaptureSession.status) {
+                                    CaptureStatus.Starting, is CaptureStatus.Capturing ->
+                                        startService(CaptureService.actionIntent(this, CaptureService.ACTION_CANCEL))
+                                    else -> {
+                                        if (CaptureSession.destroy()) {
+                                            homeMessage = "已銷毀這次截圖"
+                                        } else {
+                                            outputMessage = "暫存刪除失敗，尚未宣稱銷毀。"
+                                        }
+                                    }
+                                }
                             }) { Text("銷毀", color = Accent) }
                         },
                         dismissButton = {
@@ -185,6 +219,29 @@ class MainActivity : ComponentActivity() {
             null -> Unit
         }
     }
+
+    private fun runOutput(
+        successMessage: String,
+        format: OutputFormat,
+        operation: (OutputFormat) -> Unit,
+    ) {
+        if (outputBusy) return
+        outputBusy = true
+        outputMessage = null
+        Thread({
+            val error = runCatching { operation(format) }.exceptionOrNull()
+            runOnUiThread {
+                outputBusy = false
+                if (error != null) {
+                    outputMessage = "輸出失敗，來源圖片仍保留，請重試。"
+                } else if (CaptureSession.destroy()) {
+                    homeMessage = successMessage
+                } else {
+                    outputMessage = "$successMessage，但暫存清除失敗。"
+                }
+            }
+        }, "capture-output").start()
+    }
 }
 
 @Composable
@@ -197,7 +254,10 @@ private fun App(
     onPermission: () -> Unit,
     onFinish: () -> Unit,
     onCancel: () -> Unit,
-    onDestroyFinished: () -> Unit,
+    outputBusy: Boolean,
+    outputMessage: String?,
+    onSave: (OutputFormat) -> Unit,
+    onCopy: (OutputFormat) -> Unit,
 ) {
     Surface(color = Paper, modifier = Modifier.fillMaxSize()) {
         when (val target = permissionStep ?: status) {
@@ -205,8 +265,15 @@ private fun App(
             CaptureStatus.Idle -> HomeScreen(homeMessage, onStart)
             CaptureStatus.Starting -> CenterStatus("正在準備", "即將顯示懸浮截圖按鈕。")
             is CaptureStatus.Capturing -> CapturingScreen(target, onFinish, onCancel)
-            is CaptureStatus.Finished -> FinishedScreen(target.count, onDestroyFinished)
-            is CaptureStatus.Failed -> FailureScreen(target, onDestroyFinished)
+            is CaptureStatus.Finished -> PreviewScreen(
+                sources = (1..target.count).map(CaptureSession::sourceFile),
+                busy = outputBusy,
+                message = outputMessage,
+                onSave = onSave,
+                onCopy = onCopy,
+                onDestroy = onCancel,
+            )
+            is CaptureStatus.Failed -> FailureScreen(target, onCancel)
             else -> Unit
         }
     }
@@ -321,23 +388,192 @@ private fun CapturingScreen(status: CaptureStatus.Capturing, onFinish: () -> Uni
 }
 
 @Composable
-private fun FinishedScreen(count: Int, onDestroy: () -> Unit) {
-    Column(
-        Modifier.fillMaxSize().safeDrawingPadding().padding(20.dp),
+private fun PreviewScreen(
+    sources: List<java.io.File>,
+    busy: Boolean,
+    message: String?,
+    onSave: (OutputFormat) -> Unit,
+    onCopy: (OutputFormat) -> Unit,
+    onDestroy: () -> Unit,
+) {
+    var format by remember(sources.size) { mutableStateOf(OutputFormat.Jpg) }
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize().safeDrawingPadding(),
+        contentPadding = PaddingValues(20.dp),
+        verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
-        AppHeader("已完成")
-        Spacer(Modifier.height(48.dp))
-        Column {
-            Text("已保留 $count 張截圖", style = MaterialTheme.typography.titleLarge, color = Ink)
-            Spacer(Modifier.height(10.dp))
-            Text("原始圖片已暫存，接下來可進行預覽與拼接。", color = Quiet)
+        item {
+            AppHeader("預覽")
         }
-        Spacer(Modifier.weight(1f))
-        OutlinedButton(
-            onClick = onDestroy,
-            modifier = Modifier.fillMaxWidth().height(48.dp),
+        itemsIndexed(sources, key = { _, source -> source.path }) { index, source ->
+            PreviewImage(source, index, sources.size)
+        }
+        if (sources.size > 1) {
+            item {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = Accent.copy(alpha = 0.10f),
+                    shape = RoundedCornerShape(10.dp),
+                ) {
+                    Text(
+                        "目前顯示原始截圖；完成拼接後才會開放輸出。",
+                        modifier = Modifier.fillMaxWidth().padding(14.dp),
+                        color = Accent,
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            }
+        } else {
+            item {
+                Column {
+                    Text("輸出格式", style = MaterialTheme.typography.titleMedium, color = Ink)
+                    Spacer(Modifier.height(10.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FormatButton(
+                            label = "JPG",
+                            detail = "品質 95",
+                            selected = format == OutputFormat.Jpg,
+                            onClick = { format = OutputFormat.Jpg },
+                            modifier = Modifier.weight(1f),
+                        )
+                        FormatButton(
+                            label = "PNG",
+                            detail = "無損",
+                            selected = format == OutputFormat.Png,
+                            onClick = { format = OutputFormat.Png },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    if (message != null) {
+                        Spacer(Modifier.height(14.dp))
+                        Text(message, color = Accent, style = MaterialTheme.typography.bodyMedium)
+                    }
+                    if (format == OutputFormat.Png) {
+                        Spacer(Modifier.height(10.dp))
+                        Text("原始尺寸、無損；檔案通常較大。", color = Quiet)
+                    }
+                    Spacer(Modifier.height(28.dp))
+                    Button(
+                        onClick = { onSave(format) },
+                        enabled = !busy,
+                        modifier = Modifier.fillMaxWidth().height(52.dp),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Ink),
+                    ) {
+                        if (busy) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.height(20.dp),
+                                color = Paper,
+                                strokeWidth = 2.dp,
+                            )
+                        } else {
+                            Text("存到相簿", fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = { onCopy(format) },
+                        enabled = !busy,
+                        modifier = Modifier.fillMaxWidth().height(48.dp),
+                        shape = RoundedCornerShape(10.dp),
+                    ) { Text("複製到剪貼簿", color = Ink) }
+                    Text(
+                        "剪貼簿圖片最多保留 24 小時。",
+                        modifier = Modifier.padding(top = 8.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Quiet,
+                    )
+                }
+            }
+        }
+        if (!busy) {
+            item {
+                TextButton(
+                    onClick = onDestroy,
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                ) { Text("銷毀、不保存", color = Accent) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PreviewImage(source: java.io.File, index: Int, count: Int) {
+    val bitmap by produceState<Bitmap?>(null, source.path) {
+        value = withContext(Dispatchers.IO) { BitmapFactory.decodeFile(source.path) }
+    }
+
+    Column {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Bottom,
+        ) {
+            Text("第 ${index + 1} 張", style = MaterialTheme.typography.titleMedium, color = Ink)
+            Text(
+                bitmap?.let { "${it.width} × ${it.height} px" } ?: "載入中",
+                style = MaterialTheme.typography.bodyMedium,
+                color = Quiet,
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = Color(0xFF20231E),
+            shape = RoundedCornerShape(12.dp),
+        ) {
+            when (val preview = bitmap) {
+                null -> Column(
+                    modifier = Modifier.fillMaxWidth().height(240.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    CircularProgressIndicator(color = Accent)
+                    Spacer(Modifier.height(12.dp))
+                    Text("正在載入預覽", color = Quiet)
+                }
+                else -> Image(
+                    bitmap = preview.asImageBitmap(),
+                    contentDescription = "第 ${index + 1} 張，共 $count 張截圖",
+                    modifier = Modifier.fillMaxWidth(),
+                    contentScale = ContentScale.FillWidth,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun FormatButton(
+    label: String,
+    detail: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val content: @Composable () -> Unit = {
+        Column(horizontalAlignment = Alignment.Start) {
+            Text(label, fontWeight = FontWeight.SemiBold)
+            Text(detail, style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+    if (selected) {
+        Button(
+            onClick = onClick,
+            modifier = modifier.height(64.dp),
             shape = RoundedCornerShape(10.dp),
-        ) { Text("銷毀這次截圖", color = Accent) }
+            colors = ButtonDefaults.buttonColors(containerColor = Ink),
+            content = { content() },
+        )
+    } else {
+        OutlinedButton(
+            onClick = onClick,
+            modifier = modifier.height(64.dp),
+            shape = RoundedCornerShape(10.dp),
+            content = { content() },
+        )
     }
 }
 
