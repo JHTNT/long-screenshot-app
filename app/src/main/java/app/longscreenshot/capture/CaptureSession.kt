@@ -51,6 +51,25 @@ object CaptureSession {
 
     fun resultFile() = checkNotNull(directory).resolve("result.png")
 
+    fun deleteSource(index: Int, count: Int): Boolean {
+        if (index !in 1..count) return false
+        val removed = checkNotNull(directory).resolve(".removed-source.png")
+        if (removed.exists() || !sourceFile(index).renameTo(removed)) return false
+
+        var shiftedUntil = index - 1
+        for (next in index + 1..count) {
+            if (!sourceFile(next).renameTo(sourceFile(next - 1))) break
+            shiftedUntil = next - 1
+        }
+        if (shiftedUntil == count - 1 && removed.delete()) return true
+
+        for (current in shiftedUntil downTo index) {
+            sourceFile(current).renameTo(sourceFile(current + 1))
+        }
+        removed.renameTo(sourceFile(index))
+        return false
+    }
+
     fun destroy(): Boolean {
         val target = directory
         val deleted = target == null || !target.exists() || target.deleteRecursively()

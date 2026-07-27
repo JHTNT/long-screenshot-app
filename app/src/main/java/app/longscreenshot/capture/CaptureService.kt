@@ -72,6 +72,7 @@ class CaptureService : Service() {
             ACTION_START -> startProjection(intent)
             ACTION_FINISH -> finishCapture()
             ACTION_CANCEL -> cancelCapture()
+            ACTION_DELETE -> deleteCapture(intent.getIntExtra(EXTRA_INDEX, 0))
         }
         return START_NOT_STICKY
     }
@@ -229,6 +230,19 @@ class CaptureService : Service() {
 
     private fun updateState(message: String?) {
         CaptureSession.status = CaptureStatus.Capturing(count, message)
+    }
+
+    private fun deleteCapture(index: Int) {
+        if (stopping || captureRequested || captureBusy || index !in 1..count) return
+        if (!CaptureSession.deleteSource(index, count)) {
+            updateState("刪除失敗，截圖仍保留。")
+            return
+        }
+        count -= 1
+        updateBadge()
+        updateState(if (count == 0) "目前沒有已擷取的圖片。" else null)
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, notification(count))
     }
 
     private fun finishCapture() {
@@ -488,7 +502,9 @@ class CaptureService : Service() {
         val open = PendingIntent.getActivity(
             this,
             0,
-            Intent(this, MainActivity::class.java),
+            Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val finish = PendingIntent.getService(
@@ -546,9 +562,11 @@ class CaptureService : Service() {
         const val ACTION_FINISH = "app.longscreenshot.capture.FINISH"
         const val ACTION_CANCEL = "app.longscreenshot.capture.CANCEL"
         const val ACTION_CONFIRM_CANCEL = "app.longscreenshot.capture.CONFIRM_CANCEL"
+        private const val ACTION_DELETE = "app.longscreenshot.capture.DELETE"
         private const val EXTRA_RESULT_DATA = "projection-result-data"
         private const val EXTRA_RESULT_CODE = "projection-result-code"
         private const val EXTRA_MODE = "capture-mode"
+        private const val EXTRA_INDEX = "capture-index"
         private const val CHANNEL_ID = "capture"
         private const val NOTIFICATION_ID = 1001
         private const val BADGE_ID = 42
@@ -563,5 +581,8 @@ class CaptureService : Service() {
 
         fun actionIntent(context: Context, actionName: String) =
             Intent(context, CaptureService::class.java).apply { action = actionName }
+
+        fun deleteIntent(context: Context, index: Int) =
+            actionIntent(context, ACTION_DELETE).putExtra(EXTRA_INDEX, index)
     }
 }

@@ -19,6 +19,7 @@ import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -137,6 +138,7 @@ class MainActivity : ComponentActivity() {
                     },
                     onPermission = ::requestCurrentPermission,
                     onFinish = { startService(CaptureService.actionIntent(this, CaptureService.ACTION_FINISH)) },
+                    onDelete = { startService(CaptureService.deleteIntent(this, it)) },
                     onRegionConfirm = ::stitchSelectedRegion,
                     onCancel = { showCancelDialog = true },
                     outputBusy = outputBusy,
@@ -301,6 +303,7 @@ private fun App(
     onStart: () -> Unit,
     onPermission: () -> Unit,
     onFinish: () -> Unit,
+    onDelete: (Int) -> Unit,
     onRegionConfirm: (ClosedFloatingPointRange<Float>) -> Unit,
     onCancel: () -> Unit,
     outputBusy: Boolean,
@@ -313,7 +316,7 @@ private fun App(
             is PermissionStep -> PermissionScreen(target, onPermission)
             CaptureStatus.Idle -> HomeScreen(homeMessage, mode, onModeChange, onStart)
             CaptureStatus.Starting -> CenterStatus("正在準備", "即將顯示懸浮截圖按鈕。")
-            is CaptureStatus.Capturing -> CapturingScreen(target, onFinish, onCancel)
+            is CaptureStatus.Capturing -> CapturingScreen(target, onFinish, onCancel, onDelete)
             is CaptureStatus.SelectingRegion -> RegionSelectionScreen(
                 source = CaptureSession.sourceFile(1),
                 onConfirm = onRegionConfirm,
@@ -430,12 +433,19 @@ private fun PermissionScreen(step: PermissionStep, onContinue: () -> Unit) {
 }
 
 @Composable
-private fun CapturingScreen(status: CaptureStatus.Capturing, onFinish: () -> Unit, onCancel: () -> Unit) {
+private fun CapturingScreen(
+    status: CaptureStatus.Capturing,
+    onFinish: () -> Unit,
+    onCancel: () -> Unit,
+    onDelete: (Int) -> Unit,
+) {
+    var deleteIndex by remember { mutableStateOf<Int?>(null) }
+
     Column(
         Modifier.fillMaxSize().safeDrawingPadding().padding(20.dp),
     ) {
         AppHeader("擷取中")
-        Spacer(Modifier.height(48.dp))
+        Spacer(Modifier.height(28.dp))
         Column {
             Text("已擷取 ${status.count} 張", style = MaterialTheme.typography.titleLarge, color = Ink)
             Spacer(Modifier.height(10.dp))
@@ -445,7 +455,30 @@ private fun CapturingScreen(status: CaptureStatus.Capturing, onFinish: () -> Uni
                 color = Quiet,
             )
         }
-        Spacer(Modifier.weight(1f))
+        Spacer(Modifier.height(20.dp))
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            itemsIndexed(
+                (1..status.count).map(CaptureSession::sourceFile).chunked(2),
+                key = { _, row -> row.first().path },
+            ) { rowIndex, row ->
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    row.forEachIndexed { columnIndex, source ->
+                        CaptureThumbnail(
+                            source = source,
+                            index = rowIndex * 2 + columnIndex,
+                            count = status.count,
+                            onDelete = { deleteIndex = rowIndex * 2 + columnIndex + 1 },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    if (row.size == 1) Spacer(Modifier.weight(1f))
+                }
+            }
+        }
+        Spacer(Modifier.height(20.dp))
         Column {
             Button(
                 onClick = onFinish,
@@ -459,6 +492,56 @@ private fun CapturingScreen(status: CaptureStatus.Capturing, onFinish: () -> Uni
                 modifier = Modifier.fillMaxWidth().height(48.dp),
                 shape = RoundedCornerShape(10.dp),
             ) { Text("取消", color = Accent) }
+        }
+    }
+    deleteIndex?.let { index ->
+        AlertDialog(
+            onDismissRequest = { deleteIndex = null },
+            title = { Text("刪除第 $index 張截圖？") },
+            text = { Text("刪除後無法復原，其餘截圖會保留。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    deleteIndex = null
+                    onDelete(index)
+                }) { Text("刪除", color = Accent) }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteIndex = null }) { Text("保留") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun CaptureThumbnail(
+    source: java.io.File,
+    index: Int,
+    count: Int,
+    onDelete: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val loaded by produceState<LoadedPreview?>(null, source.path, source.lastModified()) {
+        value = withContext(Dispatchers.IO) { loadPreview(source) }
+    }
+
+    Surface(
+        modifier = modifier.combinedClickable(onClick = {}, onLongClick = onDelete),
+        color = Color(0xFF20231E),
+        shape = RoundedCornerShape(8.dp),
+    ) {
+        when (val preview = loaded) {
+            null -> Box(
+                modifier = Modifier.fillMaxWidth().height(220.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator(color = Accent)
+            }
+            else -> Image(
+                bitmap = preview.bitmap.asImageBitmap(),
+                contentDescription = "第 ${index + 1} 張，共 $count 張截圖",
+                modifier = Modifier.fillMaxWidth(),
+                contentScale = ContentScale.FillWidth,
+            )
         }
     }
 }
