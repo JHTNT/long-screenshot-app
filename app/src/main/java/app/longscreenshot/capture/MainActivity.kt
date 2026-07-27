@@ -11,6 +11,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -72,12 +73,11 @@ private val Ink = Color(0xFFF2F0E9)
 private val Accent = Color(0xFFFF7353)
 private val Quiet = Color(0xFFAAA9A2)
 
-private enum class PermissionStep { Overlay, Notification, Projection }
+private enum class PermissionStep { Overlay, Notification }
 
 class MainActivity : ComponentActivity() {
     private var permissionStep by mutableStateOf<PermissionStep?>(null)
     private var notificationAsked = false
-    private var notificationDenied by mutableStateOf(false)
     private var homeMessage by mutableStateOf<String?>(null)
     private var showCancelDialog by mutableStateOf(false)
     private var outputBusy by mutableStateOf(false)
@@ -103,7 +103,6 @@ class MainActivity : ComponentActivity() {
             continuePermissionFlow()
         }
         notificationLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
-            notificationDenied = !it
             continuePermissionFlow()
         }
         projectionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -127,7 +126,6 @@ class MainActivity : ComponentActivity() {
                 App(
                     status = CaptureSession.status,
                     permissionStep = permissionStep,
-                    notificationDenied = notificationDenied,
                     homeMessage = homeMessage,
                     mode = selectedMode,
                     onModeChange = { selectedMode = it },
@@ -163,7 +161,7 @@ class MainActivity : ComponentActivity() {
                                         startService(CaptureService.actionIntent(this, CaptureService.ACTION_CANCEL))
                                     else -> {
                                         if (CaptureSession.destroy()) {
-                                            homeMessage = "已銷毀這次截圖"
+                                            Toast.makeText(this, "已銷毀這次截圖", Toast.LENGTH_SHORT).show()
                                         } else {
                                             outputMessage = "暫存刪除失敗，尚未宣稱銷毀。"
                                         }
@@ -203,7 +201,9 @@ class MainActivity : ComponentActivity() {
             permissionStep = PermissionStep.Notification
             return
         }
-        permissionStep = PermissionStep.Projection
+        permissionStep = null
+        val manager = getSystemService(MediaProjectionManager::class.java)
+        projectionLauncher.launch(manager.createScreenCaptureIntent())
     }
 
     private fun requestCurrentPermission() {
@@ -221,10 +221,6 @@ class MainActivity : ComponentActivity() {
                 } else {
                     continuePermissionFlow()
                 }
-            }
-            PermissionStep.Projection -> {
-                val manager = getSystemService(MediaProjectionManager::class.java)
-                projectionLauncher.launch(manager.createScreenCaptureIntent())
             }
             null -> Unit
         }
@@ -296,7 +292,6 @@ class MainActivity : ComponentActivity() {
 private fun App(
     status: CaptureStatus,
     permissionStep: PermissionStep?,
-    notificationDenied: Boolean,
     homeMessage: String?,
     mode: CaptureMode,
     onModeChange: (CaptureMode) -> Unit,
@@ -312,7 +307,7 @@ private fun App(
 ) {
     Surface(color = Paper, modifier = Modifier.fillMaxSize()) {
         when (val target = permissionStep ?: status) {
-            is PermissionStep -> PermissionScreen(target, notificationDenied, onPermission)
+            is PermissionStep -> PermissionScreen(target, onPermission)
             CaptureStatus.Idle -> HomeScreen(homeMessage, mode, onModeChange, onStart)
             CaptureStatus.Starting -> CenterStatus("正在準備", "即將顯示懸浮截圖按鈕。")
             is CaptureStatus.Capturing -> CapturingScreen(target, onFinish, onCancel)
@@ -351,7 +346,7 @@ private fun HomeScreen(
     Column(
         modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(20.dp),
     ) {
-        AppHeader("本機處理")
+        AppHeader()
         Spacer(Modifier.height(48.dp))
         Column {
             Text("擷取可捲動畫面", style = MaterialTheme.typography.titleLarge, color = Ink)
@@ -382,7 +377,7 @@ private fun HomeScreen(
             }
             if (mode == CaptureMode.ContentRegion) {
                 Spacer(Modifier.height(10.dp))
-                Text("完成擷取後，會用首張圖片選擇拼接時要用於判斷範圍。", color = Quiet)
+                Text("完成擷取後，選擇拼接時要用於判斷的範圍。", color = Quiet)
             }
             if (message != null) {
                 Spacer(Modifier.height(14.dp))
@@ -402,21 +397,13 @@ private fun HomeScreen(
 }
 
 @Composable
-private fun PermissionScreen(step: PermissionStep, notificationDenied: Boolean, onContinue: () -> Unit) {
+private fun PermissionScreen(step: PermissionStep, onContinue: () -> Unit) {
     val (number, title, body, button) = when (step) {
         PermissionStep.Overlay -> listOf(
-            "設定 1 / 3", "允許懸浮按鈕", "讓截圖按鈕顯示在其他 App 上方。", "前往設定",
+            "設定 1 / 2", "允許懸浮按鈕", "讓截圖按鈕顯示在其他 App 上方。", "前往設定",
         )
         PermissionStep.Notification -> listOf(
-            "設定 2 / 3", "允許通知", "在通知中提供完成與取消操作；拒絕也能繼續。", "繼續",
-        )
-        PermissionStep.Projection -> listOf(
-            "設定 3 / 3",
-            "確認螢幕擷取",
-            if (Build.VERSION.SDK_INT >= 34)
-                "選擇整個螢幕或單一 App。受保護內容無法擷取。"
-            else "Android 會要求你同意這次螢幕擷取。",
-            "開始",
+            "設定 2 / 2", "允許通知", "在通知中提供完成與取消操作；拒絕也能繼續。", "繼續",
         )
     }
     Column(
@@ -428,10 +415,6 @@ private fun PermissionScreen(step: PermissionStep, notificationDenied: Boolean, 
             Text(title, style = MaterialTheme.typography.titleLarge, color = Ink)
             Spacer(Modifier.height(10.dp))
             Text(body, style = MaterialTheme.typography.bodyLarge, color = Quiet)
-            if (step == PermissionStep.Projection && notificationDenied) {
-                Spacer(Modifier.height(12.dp))
-                Text("通知未允許；操作時請回到本 App。", color = Accent)
-            }
         }
         Spacer(Modifier.weight(1f))
         Button(
@@ -493,7 +476,7 @@ private fun RegionSelectionScreen(
     ) {
         AppHeader("指定區域")
         Spacer(Modifier.height(8.dp))
-        Text("保留第一張頂端與最後一張底端，中間依選取範圍拼接。", color = Quiet)
+        Text("完整保留第一張與最後一張，中間依選取範圍拼接。", color = Quiet)
         Spacer(Modifier.height(8.dp))
         Surface(
             modifier = Modifier.fillMaxWidth().weight(1f),
@@ -607,9 +590,6 @@ private fun PreviewScreen(
                 AppHeader("預覽")
             }
         }
-        itemsIndexed(sources, key = { _, source -> source.path }) { index, source ->
-            PreviewImage(source, index, sources.size)
-        }
         if (!canOutput) {
             item {
                 Surface(
@@ -626,7 +606,11 @@ private fun PreviewScreen(
                     )
                 }
             }
-        } else {
+        }
+        itemsIndexed(sources, key = { _, source -> source.path }) { index, source ->
+            PreviewImage(source, index, sources.size)
+        }
+        if (canOutput) {
             item {
                 Column(Modifier.padding(horizontal = 20.dp)) {
                     if (message != null) {
@@ -680,12 +664,6 @@ private fun PreviewScreen(
                         modifier = Modifier.fillMaxWidth().height(48.dp),
                         shape = RoundedCornerShape(10.dp),
                     ) { Text("複製到剪貼簿", color = Ink) }
-                    Text(
-                        "剪貼簿圖片最多保留 24 小時。",
-                        modifier = Modifier.padding(top = 8.dp),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Quiet,
-                    )
                 }
             }
         }
@@ -709,10 +687,12 @@ private fun PreviewImage(source: java.io.File, index: Int, count: Int) {
     Column {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.Bottom,
         ) {
-            Text("第 ${index + 1} 張", style = MaterialTheme.typography.titleMedium, color = Ink)
+            if (count > 1) {
+                Text("第 ${index + 1} 張", style = MaterialTheme.typography.titleMedium, color = Ink)
+            }
+            Spacer(Modifier.weight(1f))
             Text(
                 loaded?.let { "${it.width} × ${it.height} px" } ?: "載入中",
                 style = MaterialTheme.typography.bodyMedium,
@@ -736,7 +716,8 @@ private fun PreviewImage(source: java.io.File, index: Int, count: Int) {
                 }
                 else -> Image(
                     bitmap = preview.bitmap.asImageBitmap(),
-                    contentDescription = "第 ${index + 1} 張，共 $count 張截圖",
+                    contentDescription = if (count == 1) "預覽圖片"
+                    else "第 ${index + 1} 張，共 $count 張截圖",
                     modifier = Modifier.fillMaxWidth(),
                     contentScale = ContentScale.FillWidth,
                 )
@@ -775,7 +756,7 @@ private fun FormatButton(
     modifier: Modifier = Modifier,
 ) {
     val content: @Composable () -> Unit = {
-        Column(horizontalAlignment = Alignment.Start) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(label, fontWeight = FontWeight.SemiBold)
             Text(detail, style = MaterialTheme.typography.bodyMedium)
         }
@@ -835,23 +816,25 @@ private fun CenterStatus(title: String, body: String) {
 }
 
 @Composable
-private fun AppHeader(status: String) {
+private fun AppHeader(status: String? = null) {
     Row(
         Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text("長截圖", style = MaterialTheme.typography.titleMedium, color = Ink)
-        Surface(
-            color = Accent.copy(alpha = 0.10f),
-            shape = RoundedCornerShape(99.dp),
-        ) {
-            Text(
-                status,
-                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                style = MaterialTheme.typography.labelMedium,
-                color = Accent,
-            )
+        if (status != null) {
+            Surface(
+                color = Accent.copy(alpha = 0.10f),
+                shape = RoundedCornerShape(99.dp),
+            ) {
+                Text(
+                    status,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Accent,
+                )
+            }
         }
     }
 }
