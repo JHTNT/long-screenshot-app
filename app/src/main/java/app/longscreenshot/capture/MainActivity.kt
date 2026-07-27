@@ -16,8 +16,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -36,6 +38,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RangeSlider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -49,6 +52,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -60,6 +65,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
 
 private val Paper = Color(0xFF111310)
 private val Ink = Color(0xFFF2F0E9)
@@ -76,6 +82,7 @@ class MainActivity : ComponentActivity() {
     private var showCancelDialog by mutableStateOf(false)
     private var outputBusy by mutableStateOf(false)
     private var outputMessage by mutableStateOf<String?>(null)
+    private var selectedMode by mutableStateOf(CaptureMode.General)
 
     private lateinit var overlayLauncher: ActivityResultLauncher<Intent>
     private lateinit var notificationLauncher: ActivityResultLauncher<String>
@@ -110,7 +117,7 @@ class MainActivity : ComponentActivity() {
             CaptureSession.status = CaptureStatus.Starting
             ContextCompat.startForegroundService(
                 this,
-                CaptureService.startIntent(this, result.resultCode, data),
+                CaptureService.startIntent(this, result.resultCode, data, selectedMode),
             )
         }
 
@@ -122,6 +129,8 @@ class MainActivity : ComponentActivity() {
                     permissionStep = permissionStep,
                     notificationDenied = notificationDenied,
                     homeMessage = homeMessage,
+                    mode = selectedMode,
+                    onModeChange = { selectedMode = it },
                     onStart = {
                         homeMessage = null
                         outputMessage = null
@@ -130,14 +139,15 @@ class MainActivity : ComponentActivity() {
                     },
                     onPermission = ::requestCurrentPermission,
                     onFinish = { startService(CaptureService.actionIntent(this, CaptureService.ACTION_FINISH)) },
+                    onRegionConfirm = ::stitchSelectedRegion,
                     onCancel = { showCancelDialog = true },
                     outputBusy = outputBusy,
                     outputMessage = outputMessage,
                     onSave = { format -> runOutput("已存到相簿", format) {
-                        CaptureOutput.saveToGallery(this, CaptureSession.sourceFile(1), format)
+                        CaptureOutput.saveToGallery(this, currentOutput(), format)
                     } },
                     onCopy = { format -> runOutput("已複製到剪貼簿", format) {
-                        CaptureOutput.copyToClipboard(this, CaptureSession.sourceFile(1), format)
+                        CaptureOutput.copyToClipboard(this, currentOutput(), format)
                     } },
                 )
                 if (showCancelDialog) {
@@ -220,6 +230,41 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun stitchSelectedRegion(range: ClosedFloatingPointRange<Float>) {
+        val selecting = CaptureSession.status as? CaptureStatus.SelectingRegion ?: return
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(CaptureSession.sourceFile(1).path, bounds)
+        if (bounds.outHeight <= 0) {
+            CaptureSession.status = CaptureStatus.Failed("無法讀取區域選取圖片。", selecting.count)
+            return
+        }
+        val top = (bounds.outHeight * range.start).roundToInt()
+        val bottom = (bounds.outHeight * range.endInclusive).roundToInt()
+        val region = VerticalRegion(top, bottom)
+        CaptureSession.status = CaptureStatus.Stitching(selecting.count)
+        Thread({
+            val result = runCatching {
+                AutoStitcher.stitch(
+                    sources = (1..selecting.count).map(CaptureSession::sourceFile),
+                    target = CaptureSession.resultFile(),
+                    region = region,
+                )
+            }
+            runOnUiThread {
+                CaptureSession.status = result.fold(
+                    onSuccess = { CaptureStatus.Finished(selecting.count, it.output, it.message) },
+                    onFailure = {
+                        CaptureStatus.Finished(
+                            selecting.count,
+                            null,
+                            it.message ?: "指定區域拼接失敗，來源圖片已保留",
+                        )
+                    },
+                )
+            }
+        }, "region-stitch").start()
+    }
+
     private fun runOutput(
         successMessage: String,
         format: OutputFormat,
@@ -242,6 +287,9 @@ class MainActivity : ComponentActivity() {
             }
         }, "capture-output").start()
     }
+
+    private fun currentOutput() =
+        checkNotNull((CaptureSession.status as? CaptureStatus.Finished)?.output) { "尚無可輸出的成品" }
 }
 
 @Composable
@@ -250,9 +298,12 @@ private fun App(
     permissionStep: PermissionStep?,
     notificationDenied: Boolean,
     homeMessage: String?,
+    mode: CaptureMode,
+    onModeChange: (CaptureMode) -> Unit,
     onStart: () -> Unit,
     onPermission: () -> Unit,
     onFinish: () -> Unit,
+    onRegionConfirm: (ClosedFloatingPointRange<Float>) -> Unit,
     onCancel: () -> Unit,
     outputBusy: Boolean,
     outputMessage: String?,
@@ -262,13 +313,24 @@ private fun App(
     Surface(color = Paper, modifier = Modifier.fillMaxSize()) {
         when (val target = permissionStep ?: status) {
             is PermissionStep -> PermissionScreen(target, notificationDenied, onPermission)
-            CaptureStatus.Idle -> HomeScreen(homeMessage, onStart)
+            CaptureStatus.Idle -> HomeScreen(homeMessage, mode, onModeChange, onStart)
             CaptureStatus.Starting -> CenterStatus("正在準備", "即將顯示懸浮截圖按鈕。")
             is CaptureStatus.Capturing -> CapturingScreen(target, onFinish, onCancel)
+            is CaptureStatus.SelectingRegion -> RegionSelectionScreen(
+                source = CaptureSession.sourceFile(1),
+                onConfirm = onRegionConfirm,
+                onCancel = onCancel,
+            )
+            is CaptureStatus.Stitching -> CenterStatus(
+                "正在自動拼接",
+                "正在比對 ${target.count - 1} 個接縫，來源圖片會完整保留。",
+            )
             is CaptureStatus.Finished -> PreviewScreen(
-                sources = (1..target.count).map(CaptureSession::sourceFile),
+                sources = target.output?.let(::listOf)
+                    ?: (1..target.count).map(CaptureSession::sourceFile),
+                canOutput = target.output != null,
                 busy = outputBusy,
-                message = outputMessage,
+                message = outputMessage ?: target.message,
                 onSave = onSave,
                 onCopy = onCopy,
                 onDestroy = onCancel,
@@ -280,7 +342,12 @@ private fun App(
 }
 
 @Composable
-private fun HomeScreen(message: String?, onStart: () -> Unit) {
+private fun HomeScreen(
+    message: String?,
+    mode: CaptureMode,
+    onModeChange: (CaptureMode) -> Unit,
+    onStart: () -> Unit,
+) {
     Column(
         modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(20.dp),
     ) {
@@ -294,6 +361,29 @@ private fun HomeScreen(message: String?, onStart: () -> Unit) {
                 style = MaterialTheme.typography.bodyLarge,
                 color = Quiet,
             )
+            Spacer(Modifier.height(24.dp))
+            Text("拼接模式", style = MaterialTheme.typography.titleMedium, color = Ink)
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FormatButton(
+                    label = "一般",
+                    detail = "自動判斷",
+                    selected = mode == CaptureMode.General,
+                    onClick = { onModeChange(CaptureMode.General) },
+                    modifier = Modifier.weight(1f),
+                )
+                FormatButton(
+                    label = "指定區域",
+                    detail = "框選內容",
+                    selected = mode == CaptureMode.ContentRegion,
+                    onClick = { onModeChange(CaptureMode.ContentRegion) },
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            if (mode == CaptureMode.ContentRegion) {
+                Spacer(Modifier.height(10.dp))
+                Text("完成擷取後，會用首張圖片選擇拼接時要用於判斷範圍。", color = Quiet)
+            }
             if (message != null) {
                 Spacer(Modifier.height(14.dp))
                 Text(message, color = Accent, style = MaterialTheme.typography.bodyMedium)
@@ -388,8 +478,117 @@ private fun CapturingScreen(status: CaptureStatus.Capturing, onFinish: () -> Uni
 }
 
 @Composable
+private fun RegionSelectionScreen(
+    source: java.io.File,
+    onConfirm: (ClosedFloatingPointRange<Float>) -> Unit,
+    onCancel: () -> Unit,
+) {
+    var range by remember(source.path) { mutableStateOf(0.12f..0.78f) }
+    val loaded by produceState<LoadedPreview?>(null, source.path) {
+        value = withContext(Dispatchers.IO) { loadPreview(source) }
+    }
+
+    Column(
+        Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 16.dp, vertical = 8.dp),
+    ) {
+        AppHeader("指定區域")
+        Spacer(Modifier.height(8.dp))
+        Text("保留第一張頂端與最後一張底端，中間依選取範圍拼接。", color = Quiet)
+        Spacer(Modifier.height(8.dp))
+        Surface(
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            color = Color(0xFF20231E),
+            shape = RoundedCornerShape(8.dp),
+        ) {
+            when (val preview = loaded) {
+                null -> Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    CircularProgressIndicator(color = Accent)
+                }
+                else -> Box {
+                    Image(
+                        bitmap = preview.bitmap.asImageBitmap(),
+                        contentDescription = "選擇要拼接的內容區域",
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Fit,
+                    )
+                    Canvas(Modifier.matchParentSize()) {
+                        val scale = minOf(
+                            size.width / preview.width,
+                            size.height / preview.height,
+                        )
+                        val imageSize = Size(preview.width * scale, preview.height * scale)
+                        val imageTopLeft = Offset(
+                            (size.width - imageSize.width) / 2f,
+                            (size.height - imageSize.height) / 2f,
+                        )
+                        val top = imageTopLeft.y + imageSize.height * range.start
+                        val bottom = imageTopLeft.y + imageSize.height * range.endInclusive
+                        drawRect(
+                            Paper.copy(alpha = 0.72f),
+                            topLeft = imageTopLeft,
+                            size = imageSize.copy(height = top - imageTopLeft.y),
+                        )
+                        drawRect(
+                            Paper.copy(alpha = 0.72f),
+                            topLeft = Offset(imageTopLeft.x, bottom),
+                            size = imageSize.copy(
+                                height = imageTopLeft.y + imageSize.height - bottom,
+                            ),
+                        )
+                        drawLine(
+                            color = Accent,
+                            start = Offset(imageTopLeft.x, top),
+                            end = Offset(imageTopLeft.x + imageSize.width, top),
+                            strokeWidth = 1.dp.toPx(),
+                        )
+                        drawLine(
+                            color = Accent,
+                            start = Offset(imageTopLeft.x, bottom),
+                            end = Offset(imageTopLeft.x + imageSize.width, bottom),
+                            strokeWidth = 1.dp.toPx(),
+                        )
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "保留 ${(range.start * 100).roundToInt()}% ～ ${(range.endInclusive * 100).roundToInt()}%",
+            color = Ink,
+        )
+        RangeSlider(
+            value = range,
+            onValueChange = {
+                if (it.endInclusive - it.start >= 0.25f) range = it
+            },
+            valueRange = 0f..1f,
+        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedButton(
+                onClick = onCancel,
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(10.dp),
+            ) { Text("不保存", color = Accent) }
+            Button(
+                onClick = { onConfirm(range) },
+                enabled = loaded != null,
+                modifier = Modifier.weight(2f).height(48.dp),
+                shape = RoundedCornerShape(10.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Ink),
+            ) { Text("開始拼接") }
+        }
+    }
+}
+
+@Composable
 private fun PreviewScreen(
     sources: List<java.io.File>,
+    canOutput: Boolean,
     busy: Boolean,
     message: String?,
     onSave: (OutputFormat) -> Unit,
@@ -400,24 +599,26 @@ private fun PreviewScreen(
 
     LazyColumn(
         modifier = Modifier.fillMaxSize().safeDrawingPadding(),
-        contentPadding = PaddingValues(20.dp),
+        contentPadding = PaddingValues(vertical = 20.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
         item {
-            AppHeader("預覽")
+            Box(Modifier.padding(horizontal = 20.dp)) {
+                AppHeader("預覽")
+            }
         }
         itemsIndexed(sources, key = { _, source -> source.path }) { index, source ->
             PreviewImage(source, index, sources.size)
         }
-        if (sources.size > 1) {
+        if (!canOutput) {
             item {
                 Surface(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
                     color = Accent.copy(alpha = 0.10f),
                     shape = RoundedCornerShape(10.dp),
                 ) {
                     Text(
-                        "目前顯示原始截圖；完成拼接後才會開放輸出。",
+                        message ?: "目前顯示原始截圖；低信心接縫需手動確認後才能輸出。",
                         modifier = Modifier.fillMaxWidth().padding(14.dp),
                         color = Accent,
                         style = MaterialTheme.typography.bodyMedium,
@@ -427,7 +628,11 @@ private fun PreviewScreen(
             }
         } else {
             item {
-                Column {
+                Column(Modifier.padding(horizontal = 20.dp)) {
+                    if (message != null) {
+                        Text(message, color = Accent, style = MaterialTheme.typography.bodyMedium)
+                        Spacer(Modifier.height(14.dp))
+                    }
                     Text("輸出格式", style = MaterialTheme.typography.titleMedium, color = Ink)
                     Spacer(Modifier.height(10.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -445,10 +650,6 @@ private fun PreviewScreen(
                             onClick = { format = OutputFormat.Png },
                             modifier = Modifier.weight(1f),
                         )
-                    }
-                    if (message != null) {
-                        Spacer(Modifier.height(14.dp))
-                        Text(message, color = Accent, style = MaterialTheme.typography.bodyMedium)
                     }
                     if (format == OutputFormat.Png) {
                         Spacer(Modifier.height(10.dp))
@@ -492,7 +693,7 @@ private fun PreviewScreen(
             item {
                 TextButton(
                     onClick = onDestroy,
-                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).height(48.dp),
                 ) { Text("銷毀、不保存", color = Accent) }
             }
         }
@@ -501,19 +702,19 @@ private fun PreviewScreen(
 
 @Composable
 private fun PreviewImage(source: java.io.File, index: Int, count: Int) {
-    val bitmap by produceState<Bitmap?>(null, source.path) {
-        value = withContext(Dispatchers.IO) { BitmapFactory.decodeFile(source.path) }
+    val loaded by produceState<LoadedPreview?>(null, source.path) {
+        value = withContext(Dispatchers.IO) { loadPreview(source) }
     }
 
     Column {
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.Bottom,
         ) {
             Text("第 ${index + 1} 張", style = MaterialTheme.typography.titleMedium, color = Ink)
             Text(
-                bitmap?.let { "${it.width} × ${it.height} px" } ?: "載入中",
+                loaded?.let { "${it.width} × ${it.height} px" } ?: "載入中",
                 style = MaterialTheme.typography.bodyMedium,
                 color = Quiet,
             )
@@ -522,9 +723,8 @@ private fun PreviewImage(source: java.io.File, index: Int, count: Int) {
         Surface(
             modifier = Modifier.fillMaxWidth(),
             color = Color(0xFF20231E),
-            shape = RoundedCornerShape(12.dp),
         ) {
-            when (val preview = bitmap) {
+            when (val preview = loaded) {
                 null -> Column(
                     modifier = Modifier.fillMaxWidth().height(240.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -535,7 +735,7 @@ private fun PreviewImage(source: java.io.File, index: Int, count: Int) {
                     Text("正在載入預覽", color = Quiet)
                 }
                 else -> Image(
-                    bitmap = preview.asImageBitmap(),
+                    bitmap = preview.bitmap.asImageBitmap(),
                     contentDescription = "第 ${index + 1} 張，共 $count 張截圖",
                     modifier = Modifier.fillMaxWidth(),
                     contentScale = ContentScale.FillWidth,
@@ -543,6 +743,27 @@ private fun PreviewImage(source: java.io.File, index: Int, count: Int) {
             }
         }
     }
+}
+
+private data class LoadedPreview(val bitmap: Bitmap, val width: Int, val height: Int)
+
+private fun loadPreview(source: java.io.File): LoadedPreview {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(source.path, bounds)
+    check(bounds.outWidth > 0 && bounds.outHeight > 0) { "無法讀取預覽圖片" }
+    var sample = 1
+    while (
+        bounds.outWidth.toLong() * bounds.outHeight / sample / sample > 12_000_000
+    ) {
+        sample *= 2
+    }
+    val bitmap = checkNotNull(
+        BitmapFactory.decodeFile(
+            source.path,
+            BitmapFactory.Options().apply { inSampleSize = sample },
+        ),
+    ) { "無法讀取預覽圖片" }
+    return LoadedPreview(bitmap, bounds.outWidth, bounds.outHeight)
 }
 
 @Composable

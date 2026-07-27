@@ -96,6 +96,7 @@ internal object CaptureOutput {
         }
         val bitmap = checkNotNull(BitmapFactory.decodeFile(source.path)) { "無法讀取來源圖片" }
         try {
+            check(bitmap.height <= 65_535) { "JPG 高度不可超過 65,535 px，請改用 PNG" }
             check(bitmap.compress(Bitmap.CompressFormat.JPEG, 95, output)) { "JPG 寫入失敗" }
         } finally {
             bitmap.recycle()

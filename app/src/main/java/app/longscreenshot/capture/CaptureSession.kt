@@ -6,11 +6,19 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import java.io.File
 
+enum class CaptureMode { General, ContentRegion }
+
 sealed interface CaptureStatus {
     data object Idle : CaptureStatus
     data object Starting : CaptureStatus
     data class Capturing(val count: Int, val message: String? = null) : CaptureStatus
-    data class Finished(val count: Int) : CaptureStatus
+    data class SelectingRegion(val count: Int) : CaptureStatus
+    data class Stitching(val count: Int) : CaptureStatus
+    data class Finished(
+        val count: Int,
+        val output: File?,
+        val message: String,
+    ) : CaptureStatus
     data class Failed(val message: String, val retainedCount: Int = 0) : CaptureStatus
 }
 
@@ -19,6 +27,15 @@ object CaptureSession {
         internal set
 
     var directory: File? = null
+        internal set
+
+    var systemTopInset = 0
+        internal set
+
+    var systemBottomInset = 0
+        internal set
+
+    var mode = CaptureMode.General
         internal set
 
     fun create(context: Context): File {
@@ -32,11 +49,16 @@ object CaptureSession {
     fun sourceFile(index: Int) =
         checkNotNull(directory).resolve("source-${index.toString().padStart(4, '0')}.png")
 
+    fun resultFile() = checkNotNull(directory).resolve("result.png")
+
     fun destroy(): Boolean {
         val target = directory
         val deleted = target == null || !target.exists() || target.deleteRecursively()
         if (deleted) {
             directory = null
+            systemTopInset = 0
+            systemBottomInset = 0
+            mode = CaptureMode.General
             status = CaptureStatus.Idle
         }
         return deleted

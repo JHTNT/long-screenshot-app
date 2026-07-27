@@ -29,6 +29,7 @@ import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -105,6 +106,10 @@ class CaptureService : Service() {
             captureHeight = bounds.height()
             densityDpi = resources.configuration.densityDpi
             CaptureSession.create(this)
+            CaptureSession.mode = intent.getStringExtra(EXTRA_MODE)
+                ?.let { runCatching { CaptureMode.valueOf(it) }.getOrNull() }
+                ?: CaptureMode.General
+            updateSystemInsets()
             replaceImageReader(captureWidth, captureHeight)
             virtualDisplay = projection.createVirtualDisplay(
                 "LongScreenshot",
@@ -235,13 +240,51 @@ class CaptureService : Service() {
         stopping = true
         releaseProjection()
         stopForeground(STOP_FOREGROUND_REMOVE)
-        CaptureSession.status = if (count == 0) {
+        if (count == 0) {
             CaptureSession.destroy()
-            CaptureStatus.Failed("尚未擷取任何畫面。")
-        } else {
-            CaptureStatus.Finished(count)
+            CaptureSession.status = CaptureStatus.Failed("尚未擷取任何畫面。")
+            stopSelf()
+            return
         }
-        stopSelf()
+        if (CaptureSession.mode == CaptureMode.ContentRegion) {
+            CaptureSession.status = CaptureStatus.SelectingRegion(count)
+            stopSelf()
+            return
+        }
+        if (count == 1) {
+            CaptureSession.status = CaptureStatus.Finished(
+                count,
+                CaptureSession.sourceFile(1),
+                "單張圖片不需拼接",
+            )
+            stopSelf()
+            return
+        }
+
+        CaptureSession.status = CaptureStatus.Stitching(count)
+        captureHandler.post {
+            val result = runCatching {
+                AutoStitcher.stitch(
+                    sources = (1..count).map(CaptureSession::sourceFile),
+                    target = CaptureSession.resultFile(),
+                    topInset = CaptureSession.systemTopInset,
+                    bottomInset = CaptureSession.systemBottomInset,
+                )
+            }
+            mainHandler.post {
+                CaptureSession.status = result.fold(
+                    onSuccess = { CaptureStatus.Finished(count, it.output, it.message) },
+                    onFailure = {
+                        CaptureStatus.Finished(
+                            count,
+                            null,
+                            it.message ?: "自動拼接失敗，來源圖片已保留",
+                        )
+                    },
+                )
+                stopSelf()
+            }
+        }
     }
 
     private fun cancelCapture() {
@@ -277,6 +320,31 @@ class CaptureService : Service() {
         imageReader = next
         captureWidth = width
         captureHeight = height
+        updateSystemInsets()
+    }
+
+    private fun updateSystemInsets() {
+        val screen = screenBounds()
+        if (captureWidth != screen.width() || captureHeight != screen.height()) {
+            CaptureSession.systemTopInset = 0
+            CaptureSession.systemBottomInset = 0
+            return
+        }
+        if (Build.VERSION.SDK_INT >= 30) {
+            val insets = windowManager.maximumWindowMetrics.windowInsets.getInsetsIgnoringVisibility(
+                WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout(),
+            )
+            CaptureSession.systemTopInset = insets.top
+            CaptureSession.systemBottomInset = insets.bottom
+            return
+        }
+        CaptureSession.systemTopInset = systemDimension("status_bar_height")
+        CaptureSession.systemBottomInset = systemDimension("navigation_bar_height")
+    }
+
+    private fun systemDimension(name: String): Int {
+        val id = resources.getIdentifier(name, "dimen", "android")
+        return if (id == 0) 0 else resources.getDimensionPixelSize(id)
     }
 
     private val projectionCallback = object : MediaProjection.Callback() {
@@ -480,15 +548,17 @@ class CaptureService : Service() {
         const val ACTION_CONFIRM_CANCEL = "app.longscreenshot.capture.CONFIRM_CANCEL"
         private const val EXTRA_RESULT_DATA = "projection-result-data"
         private const val EXTRA_RESULT_CODE = "projection-result-code"
+        private const val EXTRA_MODE = "capture-mode"
         private const val CHANNEL_ID = "capture"
         private const val NOTIFICATION_ID = 1001
         private const val BADGE_ID = 42
 
-        fun startIntent(context: Context, resultCode: Int, data: Intent) =
+        fun startIntent(context: Context, resultCode: Int, data: Intent, mode: CaptureMode) =
             Intent(context, CaptureService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_RESULT_DATA, data)
                 putExtra(EXTRA_RESULT_CODE, resultCode)
+                putExtra(EXTRA_MODE, mode.name)
             }
 
         fun actionIntent(context: Context, actionName: String) =
