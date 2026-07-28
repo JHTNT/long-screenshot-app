@@ -143,11 +143,11 @@ class MainActivity : ComponentActivity() {
                     onCancel = { showCancelDialog = true },
                     outputBusy = outputBusy,
                     outputMessage = outputMessage,
-                    onSave = { format -> runOutput("已存到相簿", format) {
-                        CaptureOutput.saveToGallery(this, currentOutput(), format)
+                    onSave = { format, crop -> runOutput("已存到相簿", format) {
+                        CaptureOutput.saveToGallery(this, currentOutput(), format, crop)
                     } },
-                    onCopy = { format -> runOutput("已複製到剪貼簿", format, destroySource = false) {
-                        CaptureOutput.copyToClipboard(this, currentOutput(), format)
+                    onCopy = { format, crop -> runOutput("已複製到剪貼簿", format, destroySource = false) {
+                        CaptureOutput.copyToClipboard(this, currentOutput(), format, crop)
                     } },
                 )
                 if (showCancelDialog) {
@@ -308,8 +308,8 @@ private fun App(
     onCancel: () -> Unit,
     outputBusy: Boolean,
     outputMessage: String?,
-    onSave: (OutputFormat) -> Unit,
-    onCopy: (OutputFormat) -> Unit,
+    onSave: (OutputFormat, ClosedFloatingPointRange<Float>) -> Unit,
+    onCopy: (OutputFormat, ClosedFloatingPointRange<Float>) -> Unit,
 ) {
     Surface(color = Paper, modifier = Modifier.fillMaxSize()) {
         when (val target = permissionStep ?: status) {
@@ -660,11 +660,12 @@ private fun PreviewScreen(
     canOutput: Boolean,
     busy: Boolean,
     message: String?,
-    onSave: (OutputFormat) -> Unit,
-    onCopy: (OutputFormat) -> Unit,
+    onSave: (OutputFormat, ClosedFloatingPointRange<Float>) -> Unit,
+    onCopy: (OutputFormat, ClosedFloatingPointRange<Float>) -> Unit,
     onDestroy: () -> Unit,
 ) {
     var format by remember(sources.size) { mutableStateOf(OutputFormat.Jpg) }
+    var crop by remember(sources.firstOrNull()?.path) { mutableStateOf(0f..1f) }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize().safeDrawingPadding(),
@@ -693,8 +694,27 @@ private fun PreviewScreen(
                 }
             }
         }
+        if (canOutput) {
+            item {
+                Column(Modifier.padding(horizontal = 20.dp)) {
+                    Text("上下裁切", style = MaterialTheme.typography.titleMedium, color = Ink)
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "保留 ${(crop.start * 100).roundToInt()}% ～ ${(crop.endInclusive * 100).roundToInt()}%",
+                        color = Quiet,
+                    )
+                    RangeSlider(
+                        value = crop,
+                        onValueChange = {
+                            if (it.endInclusive - it.start >= 0.02f) crop = it
+                        },
+                        valueRange = 0f..1f,
+                    )
+                }
+            }
+        }
         itemsIndexed(sources, key = { _, source -> source.path }) { index, source ->
-            PreviewImage(source, index, sources.size)
+            PreviewImage(source, index, sources.size, if (canOutput) crop else 0f..1f)
         }
         if (canOutput) {
             item {
@@ -727,7 +747,7 @@ private fun PreviewScreen(
                     }
                     Spacer(Modifier.height(28.dp))
                     Button(
-                        onClick = { onSave(format) },
+                        onClick = { onSave(format, crop) },
                         enabled = !busy,
                         modifier = Modifier.fillMaxWidth().height(52.dp),
                         shape = RoundedCornerShape(10.dp),
@@ -745,7 +765,7 @@ private fun PreviewScreen(
                     }
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(
-                        onClick = { onCopy(format) },
+                        onClick = { onCopy(format, crop) },
                         enabled = !busy,
                         modifier = Modifier.fillMaxWidth().height(48.dp),
                         shape = RoundedCornerShape(10.dp),
@@ -765,7 +785,12 @@ private fun PreviewScreen(
 }
 
 @Composable
-private fun PreviewImage(source: java.io.File, index: Int, count: Int) {
+private fun PreviewImage(
+    source: java.io.File,
+    index: Int,
+    count: Int,
+    crop: ClosedFloatingPointRange<Float>,
+) {
     val loaded by produceState<LoadedPreview?>(null, source.path) {
         value = withContext(Dispatchers.IO) { loadPreview(source) }
     }
@@ -800,13 +825,27 @@ private fun PreviewImage(source: java.io.File, index: Int, count: Int) {
                     Spacer(Modifier.height(12.dp))
                     Text("正在載入預覽", color = Quiet)
                 }
-                else -> Image(
-                    bitmap = preview.bitmap.asImageBitmap(),
-                    contentDescription = if (count == 1) "預覽圖片"
-                    else "第 ${index + 1} 張，共 $count 張截圖",
-                    modifier = Modifier.fillMaxWidth(),
-                    contentScale = ContentScale.FillWidth,
-                )
+                else -> Box {
+                    Image(
+                        bitmap = preview.bitmap.asImageBitmap(),
+                        contentDescription = if (count == 1) "裁切後預覽圖片"
+                        else "第 ${index + 1} 張，共 $count 張截圖",
+                        modifier = Modifier.fillMaxWidth(),
+                        contentScale = ContentScale.FillWidth,
+                    )
+                    Canvas(Modifier.matchParentSize()) {
+                        val top = size.height * crop.start
+                        val bottom = size.height * crop.endInclusive
+                        drawRect(Paper.copy(alpha = 0.72f), size = Size(size.width, top))
+                        drawRect(
+                            Paper.copy(alpha = 0.72f),
+                            topLeft = Offset(0f, bottom),
+                            size = Size(size.width, size.height - bottom),
+                        )
+                        drawLine(Accent, Offset(0f, top), Offset(size.width, top), 1.dp.toPx())
+                        drawLine(Accent, Offset(0f, bottom), Offset(size.width, bottom), 1.dp.toPx())
+                    }
+                }
             }
         }
     }
