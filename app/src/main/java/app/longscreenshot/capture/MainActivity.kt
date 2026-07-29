@@ -17,9 +17,12 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,13 +34,18 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RangeSlider
@@ -51,14 +59,24 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -71,8 +89,20 @@ import kotlin.math.roundToInt
 
 private val Paper = Color(0xFF111310)
 private val Ink = Color(0xFFF2F0E9)
-private val Accent = Color(0xFFFF7353)
 private val Quiet = Color(0xFFAAA9A2)
+
+private val AccentPresets = listOf(
+    Color(0xFFFF7353),
+    Color(0xFFFFA94D),
+    Color(0xFFFFD43B),
+    Color(0xFFA9E34B),
+    Color(0xFF62D6A7),
+    Color(0xFF3BC9DB),
+    Color(0xFF6DB7FF),
+    Color(0xFF748FFC),
+    Color(0xFFB197FC),
+    Color(0xFFF783AC),
+)
 
 private enum class PermissionStep { Overlay, Notification }
 
@@ -84,6 +114,7 @@ class MainActivity : ComponentActivity() {
     private var outputBusy by mutableStateOf(false)
     private var outputMessage by mutableStateOf<String?>(null)
     private var selectedMode by mutableStateOf(CaptureMode.General)
+    private var accent by mutableStateOf(AccentPresets.first())
 
     private lateinit var overlayLauncher: ActivityResultLauncher<Intent>
     private lateinit var notificationLauncher: ActivityResultLauncher<String>
@@ -123,13 +154,15 @@ class MainActivity : ComponentActivity() {
 
         handleIntent(intent)
         setContent {
-            LongScreenshotTheme {
+            LongScreenshotTheme(accent) {
                 App(
                     status = CaptureSession.status,
                     permissionStep = permissionStep,
                     homeMessage = homeMessage,
                     mode = selectedMode,
                     onModeChange = { selectedMode = it },
+                    accent = accent,
+                    onAccentChange = { accent = it },
                     onStart = {
                         homeMessage = null
                         outputMessage = null
@@ -169,10 +202,10 @@ class MainActivity : ComponentActivity() {
                                         }
                                     }
                                 }
-                            }) { Text("銷毀", color = Accent) }
+                            }) { Text("銷毀", color = MaterialTheme.colorScheme.primary) }
                         },
                         dismissButton = {
-                            TextButton(onClick = { showCancelDialog = false }) { Text("繼續擷取") }
+                            TextButton(onClick = { showCancelDialog = false }) { Text("繼續拼接") }
                         },
                     )
                 }
@@ -300,6 +333,8 @@ private fun App(
     homeMessage: String?,
     mode: CaptureMode,
     onModeChange: (CaptureMode) -> Unit,
+    accent: Color,
+    onAccentChange: (Color) -> Unit,
     onStart: () -> Unit,
     onPermission: () -> Unit,
     onFinish: () -> Unit,
@@ -314,7 +349,14 @@ private fun App(
     Surface(color = Paper, modifier = Modifier.fillMaxSize()) {
         when (val target = permissionStep ?: status) {
             is PermissionStep -> PermissionScreen(target, onPermission)
-            CaptureStatus.Idle -> HomeScreen(homeMessage, mode, onModeChange, onStart)
+            CaptureStatus.Idle -> HomeScreen(
+                homeMessage,
+                mode,
+                onModeChange,
+                accent,
+                onAccentChange,
+                onStart,
+            )
             CaptureStatus.Starting -> CenterStatus("正在準備", "即將顯示懸浮截圖按鈕。")
             is CaptureStatus.Capturing -> CapturingScreen(target, onFinish, onCancel, onDelete)
             is CaptureStatus.SelectingRegion -> RegionSelectionScreen(
@@ -347,12 +389,16 @@ private fun HomeScreen(
     message: String?,
     mode: CaptureMode,
     onModeChange: (CaptureMode) -> Unit,
+    accent: Color,
+    onAccentChange: (Color) -> Unit,
     onStart: () -> Unit,
 ) {
+    var showAccentDialog by remember { mutableStateOf(false) }
+
     Column(
         modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(20.dp),
     ) {
-        AppHeader()
+        AppHeader(onThemeClick = { showAccentDialog = true })
         Spacer(Modifier.height(48.dp))
         Column {
             Text("擷取可捲動畫面", style = MaterialTheme.typography.titleLarge, color = Ink)
@@ -387,7 +433,7 @@ private fun HomeScreen(
             }
             if (message != null) {
                 Spacer(Modifier.height(14.dp))
-                Text(message, color = Accent, style = MaterialTheme.typography.bodyMedium)
+                Text(message, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodyMedium)
             }
         }
         Spacer(Modifier.weight(1f))
@@ -395,12 +441,162 @@ private fun HomeScreen(
             onClick = onStart,
             modifier = Modifier.fillMaxWidth().height(52.dp),
             shape = RoundedCornerShape(10.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = Ink),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = Paper,
+            ),
         ) {
             Text("開始擷取", fontWeight = FontWeight.SemiBold)
         }
     }
+    if (showAccentDialog) {
+        AccentDialog(
+            accent = accent,
+            onAccentChange = onAccentChange,
+            onDismiss = { showAccentDialog = false },
+        )
+    }
 }
+
+@Composable
+private fun AccentDialog(
+    accent: Color,
+    onAccentChange: (Color) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val hsv = FloatArray(3).also { android.graphics.Color.colorToHSV(accent.toArgb(), it) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("主題顏色") },
+        text = {
+            Column {
+                AccentPresets.chunked(5).forEachIndexed { rowIndex, row ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        row.forEachIndexed { columnIndex, color ->
+                            Surface(
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .selectable(
+                                        selected = color == accent,
+                                        onClick = { onAccentChange(color) },
+                                        role = Role.RadioButton,
+                                    )
+                                    .semantics {
+                                        contentDescription =
+                                            "預設顏色 ${rowIndex * 5 + columnIndex + 1}"
+                                    },
+                                shape = CircleShape,
+                                color = color,
+                                border = BorderStroke(
+                                    if (color == accent) 3.dp else 1.dp,
+                                    if (color == accent) Ink else color.copy(alpha = 0.45f),
+                                ),
+                            ) {}
+                        }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                }
+                Spacer(Modifier.height(6.dp))
+                Text("自訂顏色", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(10.dp))
+                ColorPlane(hsv, onAccentChange)
+                Spacer(Modifier.height(12.dp))
+                HueBar(hsv, onAccentChange)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("完成") }
+        },
+    )
+}
+
+@Composable
+private fun ColorPlane(hsv: FloatArray, onColorChange: (Color) -> Unit) {
+    val saturation = (hsv[1] / 0.50f).coerceIn(0f, 1f)
+    val darkness = ((1f - hsv[2]) / 0.10f).coerceIn(0f, 1f)
+    val update: (Offset, Size) -> Unit = { point, bounds ->
+        onColorChange(pickerColor(hsv[0], point.x / bounds.width, point.y / bounds.height))
+    }
+
+    Canvas(
+        Modifier
+            .fillMaxWidth()
+            .height(160.dp)
+            .colorPointer(update)
+            .semantics { contentDescription = "自訂顏色區域" },
+    ) {
+        drawRect(
+            Brush.horizontalGradient(
+                listOf(Color.White, Color.hsv(hsv[0], 0.50f, 1f)),
+            ),
+        )
+        drawRect(
+            Brush.verticalGradient(
+                listOf(Color.Transparent, Color.Black.copy(alpha = 0.10f)),
+            ),
+        )
+        val marker = Offset(size.width * saturation, size.height * darkness)
+        drawCircle(Ink, 9.dp.toPx(), marker, style = Stroke(2.dp.toPx()))
+        drawCircle(Color.White, 7.dp.toPx(), marker, style = Stroke(2.dp.toPx()))
+    }
+}
+
+@Composable
+private fun HueBar(hsv: FloatArray, onColorChange: (Color) -> Unit) {
+    val update: (Offset, Size) -> Unit = { point, bounds ->
+        onColorChange(
+            pickerColor(
+                point.x / bounds.width * 360f,
+                hsv[1] / 0.50f,
+                (1f - hsv[2]) / 0.10f,
+            ),
+        )
+    }
+
+    Canvas(
+        Modifier
+            .fillMaxWidth()
+            .height(48.dp)
+            .colorPointer(update)
+            .semantics { contentDescription = "色相選擇" },
+    ) {
+        drawRect(
+            Brush.horizontalGradient(
+                (0..6).map { Color.hsv(it * 60f, 1f, 1f) },
+            ),
+        )
+        val markerX = size.width * hsv[0] / 360f
+        drawLine(Ink, Offset(markerX, 0f), Offset(markerX, size.height), 4.dp.toPx())
+        drawLine(Color.White, Offset(markerX, 0f), Offset(markerX, size.height), 2.dp.toPx())
+    }
+}
+
+private fun Modifier.colorPointer(onPosition: (Offset, Size) -> Unit) = composed {
+    val currentOnPosition by rememberUpdatedState(onPosition)
+    pointerInput(Unit) {
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false)
+            val bounds = Size(size.width.toFloat(), size.height.toFloat())
+            currentOnPosition(down.position, bounds)
+            do {
+                val change = awaitPointerEvent().changes.first()
+                currentOnPosition(change.position, bounds)
+                change.consume()
+            } while (change.pressed)
+        }
+    }
+}
+
+internal fun pickerColor(hue: Float, xFraction: Float, yFraction: Float): Color =
+    Color.hsv(
+        ((hue % 360f) + 360f) % 360f,
+        xFraction.coerceIn(0f, 1f) * 0.50f,
+        1f - yFraction.coerceIn(0f, 1f) * 0.10f,
+    )
 
 @Composable
 private fun PermissionScreen(step: PermissionStep, onContinue: () -> Unit) {
@@ -491,7 +687,7 @@ private fun CapturingScreen(
                 onClick = onCancel,
                 modifier = Modifier.fillMaxWidth().height(48.dp),
                 shape = RoundedCornerShape(10.dp),
-            ) { Text("取消", color = Accent) }
+            ) { Text("取消", color = MaterialTheme.colorScheme.primary) }
         }
     }
     deleteIndex?.let { index ->
@@ -503,7 +699,7 @@ private fun CapturingScreen(
                 TextButton(onClick = {
                     deleteIndex = null
                     onDelete(index)
-                }) { Text("刪除", color = Accent) }
+                }) { Text("刪除", color = MaterialTheme.colorScheme.primary) }
             },
             dismissButton = {
                 TextButton(onClick = { deleteIndex = null }) { Text("保留") }
@@ -534,7 +730,7 @@ private fun CaptureThumbnail(
                 modifier = Modifier.fillMaxWidth().height(220.dp),
                 contentAlignment = Alignment.Center,
             ) {
-                CircularProgressIndicator(color = Accent)
+                CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
             }
             else -> Image(
                 bitmap = preview.bitmap.asImageBitmap(),
@@ -553,6 +749,7 @@ private fun RegionSelectionScreen(
     onCancel: () -> Unit,
 ) {
     var range by remember(source.path) { mutableStateOf(0.12f..0.78f) }
+    val accentColor = MaterialTheme.colorScheme.primary
     val loaded by produceState<LoadedPreview?>(null, source.path) {
         value = withContext(Dispatchers.IO) { loadPreview(source) }
     }
@@ -574,7 +771,7 @@ private fun RegionSelectionScreen(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center,
                 ) {
-                    CircularProgressIndicator(color = Accent)
+                    CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
                 }
                 else -> Box {
                     Image(
@@ -608,13 +805,13 @@ private fun RegionSelectionScreen(
                             ),
                         )
                         drawLine(
-                            color = Accent,
+                            color = accentColor,
                             start = Offset(imageTopLeft.x, top),
                             end = Offset(imageTopLeft.x + imageSize.width, top),
                             strokeWidth = 1.dp.toPx(),
                         )
                         drawLine(
-                            color = Accent,
+                            color = accentColor,
                             start = Offset(imageTopLeft.x, bottom),
                             end = Offset(imageTopLeft.x + imageSize.width, bottom),
                             strokeWidth = 1.dp.toPx(),
@@ -642,7 +839,7 @@ private fun RegionSelectionScreen(
                 onClick = onCancel,
                 modifier = Modifier.weight(1f).height(48.dp),
                 shape = RoundedCornerShape(10.dp),
-            ) { Text("不保存", color = Accent) }
+            ) { Text("不保存", color = MaterialTheme.colorScheme.primary) }
             Button(
                 onClick = { onConfirm(range) },
                 enabled = loaded != null,
@@ -681,13 +878,13 @@ private fun PreviewScreen(
             item {
                 Surface(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
-                    color = Accent.copy(alpha = 0.10f),
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
                     shape = RoundedCornerShape(10.dp),
                 ) {
                     Text(
                         message ?: "目前顯示原始截圖；低信心接縫需手動確認後才能輸出。",
                         modifier = Modifier.fillMaxWidth().padding(14.dp),
-                        color = Accent,
+                        color = MaterialTheme.colorScheme.primary,
                         style = MaterialTheme.typography.bodyMedium,
                         textAlign = TextAlign.Center,
                     )
@@ -720,7 +917,11 @@ private fun PreviewScreen(
             item {
                 Column(Modifier.padding(horizontal = 20.dp)) {
                     if (message != null) {
-                        Text(message, color = Accent, style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            message,
+                            color = MaterialTheme.colorScheme.primary,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
                         Spacer(Modifier.height(14.dp))
                     }
                     Text("輸出格式", style = MaterialTheme.typography.titleMedium, color = Ink)
@@ -778,7 +979,7 @@ private fun PreviewScreen(
                 TextButton(
                     onClick = onDestroy,
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).height(48.dp),
-                ) { Text("銷毀、不保存", color = Accent) }
+                ) { Text("銷毀、不保存", color = MaterialTheme.colorScheme.primary) }
             }
         }
     }
@@ -791,6 +992,7 @@ private fun PreviewImage(
     count: Int,
     crop: ClosedFloatingPointRange<Float>,
 ) {
+    val accentColor = MaterialTheme.colorScheme.primary
     val loaded by produceState<LoadedPreview?>(null, source.path) {
         value = withContext(Dispatchers.IO) { loadPreview(source) }
     }
@@ -821,7 +1023,7 @@ private fun PreviewImage(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center,
                 ) {
-                    CircularProgressIndicator(color = Accent)
+                    CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
                     Spacer(Modifier.height(12.dp))
                     Text("正在載入預覽", color = Quiet)
                 }
@@ -842,8 +1044,8 @@ private fun PreviewImage(
                             topLeft = Offset(0f, bottom),
                             size = Size(size.width, size.height - bottom),
                         )
-                        drawLine(Accent, Offset(0f, top), Offset(size.width, top), 1.dp.toPx())
-                        drawLine(Accent, Offset(0f, bottom), Offset(size.width, bottom), 1.dp.toPx())
+                        drawLine(accentColor, Offset(0f, top), Offset(size.width, top), 1.dp.toPx())
+                        drawLine(accentColor, Offset(0f, bottom), Offset(size.width, bottom), 1.dp.toPx())
                     }
                 }
             }
@@ -923,7 +1125,7 @@ private fun FailureScreen(status: CaptureStatus.Failed, onDestroy: () -> Unit) {
             onClick = onDestroy,
             modifier = Modifier.fillMaxWidth().height(48.dp),
             shape = RoundedCornerShape(10.dp),
-        ) { Text("銷毀暫存", color = Accent) }
+        ) { Text("銷毀暫存", color = MaterialTheme.colorScheme.primary) }
     }
 }
 
@@ -941,23 +1143,38 @@ private fun CenterStatus(title: String, body: String) {
 }
 
 @Composable
-private fun AppHeader(status: String? = null) {
+private fun AppHeader(
+    status: String? = null,
+    onThemeClick: (() -> Unit)? = null,
+) {
     Row(
         Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text("長截圖", style = MaterialTheme.typography.titleMedium, color = Ink)
-        if (status != null) {
+        if (onThemeClick != null) {
+            IconButton(
+                onClick = onThemeClick,
+                modifier = Modifier.semantics { contentDescription = "調整主題顏色" },
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_palette),
+                    contentDescription = null,
+                    modifier = Modifier.size(26.dp),
+                    tint = Ink,
+                )
+            }
+        } else if (status != null) {
             Surface(
-                color = Accent.copy(alpha = 0.10f),
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
                 shape = RoundedCornerShape(99.dp),
             ) {
                 Text(
                     status,
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
                     style = MaterialTheme.typography.labelMedium,
-                    color = Accent,
+                    color = MaterialTheme.colorScheme.primary,
                 )
             }
         }
@@ -965,10 +1182,10 @@ private fun AppHeader(status: String? = null) {
 }
 
 @Composable
-private fun LongScreenshotTheme(content: @Composable () -> Unit) {
+private fun LongScreenshotTheme(accent: Color, content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = darkColorScheme(
-            primary = Accent,
+            primary = accent,
             onPrimary = Paper,
             background = Paper,
             onBackground = Ink,
@@ -977,7 +1194,7 @@ private fun LongScreenshotTheme(content: @Composable () -> Unit) {
             surfaceVariant = Color(0xFF20231E),
             onSurfaceVariant = Quiet,
             outline = Color(0xFF464942),
-            error = Accent,
+            error = accent,
         ),
         typography = Typography(
             titleLarge = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 20.sp, lineHeight = 26.sp),
