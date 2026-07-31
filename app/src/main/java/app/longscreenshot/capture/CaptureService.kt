@@ -25,7 +25,6 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
-import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -56,7 +55,6 @@ class CaptureService : Service() {
 
     @Volatile private var captureRequested = false
     @Volatile private var captureBusy = false
-    @Volatile private var captureAfterNanos = 0L
     @Volatile private var captureToken = 0
 
     override fun onCreate() {
@@ -118,7 +116,7 @@ class CaptureService : Service() {
                 captureHeight,
                 densityDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                imageReader?.surface,
+                null,
                 null,
                 mainHandler,
             )
@@ -154,7 +152,11 @@ class CaptureService : Service() {
         captureToken += 1
         val token = captureToken
         overlay?.visibility = View.INVISIBLE
-        captureAfterNanos = System.nanoTime() + 150_000_000L
+        captureHandler.postDelayed({
+            if (captureRequested && captureToken == token) {
+                imageReader?.let { virtualDisplay?.setSurface(it.surface) }
+            }
+        }, 50)
         mainHandler.postDelayed({
             if (captureRequested && captureToken == token) failCapture("截圖逾時，請再試一次。")
         }, 2_500)
@@ -162,17 +164,18 @@ class CaptureService : Service() {
 
     private fun handleImage(reader: ImageReader) {
         val image = reader.acquireLatestImage() ?: return
-        if (!captureRequested || image.timestamp < captureAfterNanos) {
+        if (!captureRequested) {
             image.close()
             return
         }
         captureRequested = false
         captureBusy = true
+        virtualDisplay?.setSurface(null)
+        mainHandler.post { overlay?.visibility = View.VISIBLE }
         try {
             saveImage(image)
             count += 1
             mainHandler.post {
-                overlay?.visibility = View.VISIBLE
                 updateBadge()
                 updateState(
                     if (count == 1) "向下捲動並保留一部分重疊內容，再按一次截圖。" else null,
@@ -224,6 +227,7 @@ class CaptureService : Service() {
 
     private fun failCapture(message: String) {
         captureRequested = false
+        virtualDisplay?.setSurface(null)
         overlay?.visibility = View.VISIBLE
         updateState(message)
     }
@@ -327,8 +331,8 @@ class CaptureService : Service() {
         val next = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         next.setOnImageAvailableListener(::handleImage, captureHandler)
         virtualDisplay?.apply {
+            setSurface(null)
             resize(width, height, densityDpi)
-            setSurface(next.surface)
         }
         imageReader?.close()
         imageReader = next
