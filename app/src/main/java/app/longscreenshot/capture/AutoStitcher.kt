@@ -2,8 +2,6 @@ package app.longscreenshot.capture
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Canvas
-import android.graphics.Rect
 import java.io.File
 import kotlin.math.abs
 import kotlin.math.max
@@ -225,6 +223,7 @@ internal object AutoStitcher {
         val output: File?,
         val seams: List<StitchProposal>,
         val message: String,
+        val manualPlan: ManualStitchPlan? = null,
     )
 
     fun stitch(
@@ -235,7 +234,7 @@ internal object AutoStitcher {
         region: VerticalRegion? = null,
     ): Result {
         require(sources.isNotEmpty()) { "沒有來源圖片" }
-        if (sources.size == 1 && region == null) {
+        if (sources.size == 1) {
             return Result(sources.single(), emptyList(), "單張圖片不需拼接")
         }
 
@@ -265,58 +264,24 @@ internal object AutoStitcher {
             previous.recycle()
         }
 
+        val manualPlan = ManualStitcher.initialPlan(width, height, seams)
         val firstLow = seams.indexOfFirst { !it.confident }
         if (firstLow >= 0) {
-            return Result(null, seams, "第 ${firstLow + 1} 個接縫：${seams[firstLow].reason.message}")
+            return Result(
+                output = null,
+                seams = seams,
+                message = "第 ${firstLow + 1} 個接縫：${seams[firstLow].reason.message}",
+                manualPlan = manualPlan,
+            )
         }
 
-        val bottomCrop = seams.maxOfOrNull { it.bottomCrop } ?: (height - checkNotNull(region).bottom)
-        val outputHeight = height.toLong() + seams.sumOf { it.shift.toLong() }
-        require(outputHeight in 1..Int.MAX_VALUE.toLong()) { "成品高度無效" }
-        val required = width.toLong() * (outputHeight + height) * 4
-        val runtime = Runtime.getRuntime()
-        val available = runtime.maxMemory() - (runtime.totalMemory() - runtime.freeMemory())
-        require(required <= available) { "可用記憶體不足，無法安全產生成品" }
-
-        val output = Bitmap.createBitmap(width, outputHeight.toInt(), Bitmap.Config.ARGB_8888)
-        try {
-            val canvas = Canvas(output)
-            var y = 0
-            val contentBottom = region?.bottom ?: height - bottomCrop
-            draw(canvas, decode(sources.first()), 0, contentBottom, y)
-            y += contentBottom
-            for (index in 1 until sources.size) {
-                val seam = seams[index - 1]
-                val shift = seam.shift
-                if (shift > 0) {
-                    draw(
-                        canvas,
-                        decode(sources[index]),
-                        contentBottom - shift,
-                        contentBottom,
-                        y,
-                    )
-                    y += shift
-                }
-            }
-            if (contentBottom < height) {
-                draw(canvas, decode(sources.last()), contentBottom, height, y)
-            }
-            target.outputStream().use {
-                check(output.compress(Bitmap.CompressFormat.PNG, 100, it)) { "拼接圖片寫入失敗" }
-            }
-        } catch (error: Throwable) {
-            target.delete()
-            throw error
-        } finally {
-            output.recycle()
-        }
+        ManualStitcher.stitch(sources, target, manualPlan)
         val message = if (region == null) {
             "已自動拼接 ${seams.size} 個接縫"
         } else {
             "已依指定區域拼接 ${seams.size} 個接縫"
         }
-        return Result(target, seams, message)
+        return Result(target, seams, message, manualPlan)
     }
 
     private fun decode(file: File): Bitmap =
@@ -337,20 +302,4 @@ internal object AutoStitcher {
         return LumaImage(width, height, luma)
     }
 
-    private fun draw(canvas: Canvas, bitmap: Bitmap, top: Int, bottom: Int, outputTop: Int) {
-        draw(
-            canvas,
-            bitmap,
-            Rect(0, top, bitmap.width, bottom),
-            Rect(0, outputTop, bitmap.width, outputTop + bottom - top),
-        )
-    }
-
-    private fun draw(canvas: Canvas, bitmap: Bitmap, source: Rect, target: Rect) {
-        try {
-            canvas.drawBitmap(bitmap, source, target, null)
-        } finally {
-            bitmap.recycle()
-        }
-    }
 }

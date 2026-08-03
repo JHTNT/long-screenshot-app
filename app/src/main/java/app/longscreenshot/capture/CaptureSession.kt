@@ -18,6 +18,12 @@ sealed interface CaptureStatus {
         val count: Int,
         val output: File?,
         val message: String,
+        val manualPlan: ManualStitchPlan? = null,
+    ) : CaptureStatus
+    data class Manual(
+        val count: Int,
+        val plan: ManualStitchPlan,
+        val message: String? = null,
     ) : CaptureStatus
     data class Failed(val message: String, val retainedCount: Int = 0) : CaptureStatus
 }

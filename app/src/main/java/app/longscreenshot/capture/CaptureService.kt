@@ -291,7 +291,9 @@ class CaptureService : Service() {
             }
             mainHandler.post {
                 CaptureSession.status = result.fold(
-                    onSuccess = { CaptureStatus.Finished(count, it.output, it.message) },
+                    onSuccess = {
+                        CaptureStatus.Finished(count, it.output, it.message, it.manualPlan)
+                    },
                     onFailure = {
                         CaptureStatus.Finished(
                             count,
