@@ -6,10 +6,10 @@ import org.junit.Test
 
 class StitchMatcherTest {
     @Test
-    fun findsShiftWithTenPercentOverlap() {
+    fun findsShiftWithSixPercentOverlap() {
         val width = 40
         val height = 200
-        val shift = 180
+        val shift = 188
         fun pixels(offset: Int) = ByteArray(width * height) { index ->
             val x = index % width
             val y = index / width + offset
@@ -24,7 +24,7 @@ class StitchMatcherTest {
 
         assertTrue(seam.confident)
         assertEquals(shift, seam.shift)
-        assertEquals(20, seam.overlap)
+        assertEquals(12, seam.overlap)
     }
 
     @Test
@@ -116,5 +116,58 @@ class StitchMatcherTest {
         assertTrue(seam.confident)
         assertEquals(shift, seam.shift)
         assertTrue(seam.bottomCrop >= 18)
+    }
+
+    @Test
+    fun acceptsNearExactOverlapInRepeatedRegion() {
+        val width = 60
+        val height = 240
+        val shift = 80
+        fun pixels(offset: Int, brightness: Int) = ByteArray(width * height) { index ->
+            val x = index % width
+            val y = index / width + offset
+            (40 + (x * 7 + y % 40 * 5) % 160 + y / 40 * 3 + brightness).toByte()
+        }
+
+        val seam = StitchMatcher.find(
+            LumaImage(width, height, pixels(0, 0)),
+            LumaImage(width, height, pixels(shift, 1)),
+            region = VerticalRegion(20, 220),
+        )
+
+        assertTrue(seam.toString(), seam.confident)
+        assertEquals(shift, seam.shift)
+    }
+
+    @Test
+    fun ignoresTexturelessSliverButKeepsSmallOverlapSearch() {
+        val width = 30
+        val height = 200
+        val shift = 60
+        fun pixels(offset: Int, brightness: Int) = ByteArray(width * height) { index ->
+            val x = index % width
+            val y = index / width + offset
+            (30 + (x * 13 + y * 7 + x * y % 29) % 180 + brightness).toByte()
+        }
+        val first = pixels(0, 0)
+        val second = pixels(shift, 1)
+        for (y in 160 until height) {
+            for (x in 0 until width) first[y * width + x] = 80
+        }
+        for (y in 100 until 140) {
+            for (x in 0 until width) second[y * width + x] = 80
+        }
+        for (y in 0 until 16) {
+            for (x in 0 until width) second[y * width + x] = 80
+        }
+
+        val seam = StitchMatcher.find(
+            LumaImage(width, height, first),
+            LumaImage(width, height, second),
+            region = VerticalRegion(0, height),
+        )
+
+        assertEquals(shift, seam.shift)
+        assertTrue(seam.toString(), seam.confident)
     }
 }

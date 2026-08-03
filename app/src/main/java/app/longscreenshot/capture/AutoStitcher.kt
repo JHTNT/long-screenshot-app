@@ -51,8 +51,8 @@ internal object StitchMatcher {
     private const val MIN_ZONE_SCORE = 0.94
     private const val MIN_TEXTURE = 0.08
     private const val MIN_GAP = 0.01
-    private const val EXACT_SCORE = 0.999
-    private const val EXACT_GAP = 0.005
+    private const val EXACT_SCORE = 0.998
+    private const val EXACT_GAP = 0.001
 
     fun find(
         a: LumaImage,
@@ -123,6 +123,8 @@ internal object StitchMatcher {
         val step = max(1, contentHeight / 200)
         val coarse = (minimum..maximum step step).map { score(a, b, it, top, bottom) }
         val seeds = coarse
+            .filter { it.texture >= MIN_TEXTURE }
+            .ifEmpty { coarse }
             .sortedByDescending { it.score }
             .take(5)
         val fine = seeds
@@ -131,9 +133,10 @@ internal object StitchMatcher {
                     .map { score(a, b, it, top, bottom) }
             }
             .distinctBy { it.shift }
-        val best = fine.maxBy { it.score }
         val candidates = coarse + fine
-        val second = candidates
+        val ranked = candidates.filter { it.texture >= MIN_TEXTURE }.ifEmpty { candidates }
+        val best = ranked.maxBy { it.score }
+        val second = ranked
             .asSequence()
             .filter { abs(it.shift - best.shift) > step * 2 }
             .maxOfOrNull { it.score }

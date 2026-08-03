@@ -346,16 +346,28 @@ class CaptureService : Service() {
     private fun updateSystemInsets() {
         val screen = screenBounds()
         if (captureWidth != screen.width() || captureHeight != screen.height()) {
-            CaptureSession.systemTopInset = 0
-            CaptureSession.systemBottomInset = 0
+            CaptureSession.systemTopInset = resolveSystemInset(
+                0,
+                systemDimension("status_bar_height"),
+            )
+            CaptureSession.systemBottomInset = resolveSystemInset(
+                0,
+                systemDimension("navigation_bar_height"),
+            )
             return
         }
         if (Build.VERSION.SDK_INT >= 30) {
             val insets = windowManager.maximumWindowMetrics.windowInsets.getInsetsIgnoringVisibility(
                 WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout(),
             )
-            CaptureSession.systemTopInset = insets.top
-            CaptureSession.systemBottomInset = insets.bottom
+            CaptureSession.systemTopInset = resolveSystemInset(
+                insets.top,
+                systemDimension("status_bar_height"),
+            )
+            CaptureSession.systemBottomInset = resolveSystemInset(
+                insets.bottom,
+                systemDimension("navigation_bar_height"),
+            )
             return
         }
         CaptureSession.systemTopInset = systemDimension("status_bar_height")
@@ -592,3 +604,6 @@ class CaptureService : Service() {
             actionIntent(context, ACTION_DELETE).putExtra(EXTRA_INDEX, index)
     }
 }
+
+internal fun resolveSystemInset(windowInset: Int, resourceInset: Int): Int =
+    max(windowInset, resourceInset)
