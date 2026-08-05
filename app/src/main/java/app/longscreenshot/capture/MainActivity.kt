@@ -76,8 +76,11 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -88,6 +91,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 private val Paper = Color(0xFF111310)
@@ -820,7 +824,6 @@ private fun RegionSelectionScreen(
     onCancel: () -> Unit,
 ) {
     var range by remember(source.path) { mutableStateOf(0.12f..0.78f) }
-    val accentColor = MaterialTheme.colorScheme.primary
     val loaded by produceState<LoadedPreview?>(null, source.path) {
         value = withContext(Dispatchers.IO) { loadPreview(source) }
     }
@@ -851,57 +854,22 @@ private fun RegionSelectionScreen(
                         modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Fit,
                     )
-                    Canvas(Modifier.matchParentSize()) {
-                        val scale = minOf(
-                            size.width / preview.width,
-                            size.height / preview.height,
-                        )
-                        val imageSize = Size(preview.width * scale, preview.height * scale)
-                        val imageTopLeft = Offset(
-                            (size.width - imageSize.width) / 2f,
-                            (size.height - imageSize.height) / 2f,
-                        )
-                        val top = imageTopLeft.y + imageSize.height * range.start
-                        val bottom = imageTopLeft.y + imageSize.height * range.endInclusive
-                        drawRect(
-                            Paper.copy(alpha = 0.72f),
-                            topLeft = imageTopLeft,
-                            size = imageSize.copy(height = top - imageTopLeft.y),
-                        )
-                        drawRect(
-                            Paper.copy(alpha = 0.72f),
-                            topLeft = Offset(imageTopLeft.x, bottom),
-                            size = imageSize.copy(
-                                height = imageTopLeft.y + imageSize.height - bottom,
-                            ),
-                        )
-                        drawLine(
-                            color = accentColor,
-                            start = Offset(imageTopLeft.x, top),
-                            end = Offset(imageTopLeft.x + imageSize.width, top),
-                            strokeWidth = 1.dp.toPx(),
-                        )
-                        drawLine(
-                            color = accentColor,
-                            start = Offset(imageTopLeft.x, bottom),
-                            end = Offset(imageTopLeft.x + imageSize.width, bottom),
-                            strokeWidth = 1.dp.toPx(),
-                        )
-                    }
+                    CropOverlay(
+                        modifier = Modifier.matchParentSize(),
+                        imageWidth = preview.bitmap.width,
+                        imageHeight = preview.bitmap.height,
+                        range = range,
+                        minimumRange = 0.25f,
+                        fitImage = true,
+                        onRangeChange = { range = it },
+                    )
                 }
             }
         }
         Spacer(Modifier.height(6.dp))
         Text(
-            "保留 ${(range.start * 100).roundToInt()}% ～ ${(range.endInclusive * 100).roundToInt()}%",
-            color = Ink,
-        )
-        RangeSlider(
-            value = range,
-            onValueChange = {
-                if (it.endInclusive - it.start >= 0.25f) range = it
-            },
-            valueRange = 0f..1f,
+            "拖曳上下邊界線調整",
+            color = Quiet,
         )
         Row(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -919,6 +887,207 @@ private fun RegionSelectionScreen(
                 colors = ButtonDefaults.buttonColors(containerColor = Ink),
             ) { Text("開始拼接") }
         }
+    }
+}
+
+@Composable
+internal fun CropOverlay(
+    modifier: Modifier,
+    imageWidth: Int,
+    imageHeight: Int,
+    range: ClosedFloatingPointRange<Float>,
+    minimumRange: Float,
+    fitImage: Boolean,
+    enabled: Boolean = true,
+    onRangeChange: (ClosedFloatingPointRange<Float>) -> Unit,
+) {
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    val currentRange by rememberUpdatedState(range)
+    val currentOnRangeChange by rememberUpdatedState(onRangeChange)
+    val accentColor = MaterialTheme.colorScheme.primary
+
+    Canvas(
+        modifier
+            .semantics {
+                contentDescription = "拖曳上下邊界線調整裁切範圍"
+                stateDescription =
+                    "目前保留 ${(range.start * 100).roundToInt()}% 至 ${(range.endInclusive * 100).roundToInt()}%"
+                if (enabled) {
+                    fun moveHandle(dragTop: Boolean, delta: Float): Boolean {
+                        val current = if (dragTop) range.start else range.endInclusive
+                        val updated = draggedCropRange(
+                            range = range,
+                            dragTop = dragTop,
+                            fraction = current + delta,
+                            minimumRange = minimumRange,
+                        ) ?: return false
+                        onRangeChange(updated)
+                        return true
+                    }
+                    customActions = listOf(
+                        CustomAccessibilityAction("上邊界往上") { moveHandle(true, -0.01f) },
+                        CustomAccessibilityAction("上邊界往下") { moveHandle(true, 0.01f) },
+                        CustomAccessibilityAction("下邊界往上") { moveHandle(false, -0.01f) },
+                        CustomAccessibilityAction("下邊界往下") { moveHandle(false, 0.01f) },
+                    )
+                } else {
+                    customActions = emptyList()
+                }
+            }
+            .pointerInput(imageWidth, imageHeight, fitImage, minimumRange, enabled) {
+                if (enabled) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        val frame = cropImageFrame(
+                            Size(size.width.toFloat(), size.height.toFloat()),
+                            imageWidth,
+                            imageHeight,
+                            fitImage,
+                        )
+                        if (frame.height <= 0f) return@awaitEachGesture
+                        if (down.position.x < frame.left || down.position.x > frame.right) {
+                            return@awaitEachGesture
+                        }
+
+                        val topY = frame.top + frame.height * currentRange.start
+                        val bottomY = frame.top + frame.height * currentRange.endInclusive
+                        val hitSlop = with(density) { 28.dp.toPx() }
+                        val topDistance = abs(down.position.y - topY)
+                        val bottomDistance = abs(down.position.y - bottomY)
+                        val dragTop = when {
+                            topDistance <= hitSlop && topDistance <= bottomDistance -> true
+                            bottomDistance <= hitSlop -> false
+                            else -> null
+                        } ?: return@awaitEachGesture
+
+                        down.consume()
+                        var draggedRange = currentRange
+                        while (true) {
+                            val change = awaitPointerEvent().changes.firstOrNull() ?: break
+                            if (!change.pressed) {
+                                change.consume()
+                                break
+                            }
+                            val fraction =
+                                ((change.position.y - frame.top) / frame.height).coerceIn(0f, 1f)
+                            draggedCropRange(
+                                range = draggedRange,
+                                dragTop = dragTop,
+                                fraction = fraction,
+                                minimumRange = minimumRange,
+                            )?.let {
+                                draggedRange = it
+                                currentOnRangeChange(it)
+                            }
+                            change.consume()
+                        }
+                    }
+                }
+            },
+    ) {
+        val frame = cropImageFrame(size, imageWidth, imageHeight, fitImage)
+        val top = frame.top + frame.height * range.start
+        val bottom = frame.top + frame.height * range.endInclusive
+        drawRect(
+            Paper.copy(alpha = 0.72f),
+            topLeft = Offset(frame.left, frame.top),
+            size = Size(frame.width, (top - frame.top).coerceIn(0f, frame.height)),
+        )
+        drawRect(
+            Paper.copy(alpha = 0.72f),
+            topLeft = Offset(frame.left, bottom),
+            size = Size(frame.width, (frame.bottom - bottom).coerceIn(0f, frame.height)),
+        )
+        drawLine(
+            color = accentColor,
+            start = Offset(frame.left, top),
+            end = Offset(frame.right, top),
+            strokeWidth = 1.dp.toPx(),
+        )
+        drawLine(
+            color = accentColor,
+            start = Offset(frame.left, bottom),
+            end = Offset(frame.right, bottom),
+            strokeWidth = 1.dp.toPx(),
+        )
+        fun drawDragIcon(y: Float) {
+            val centerX = frame.left + frame.width / 2f
+            val length = 7.dp.toPx()
+            val head = 3.dp.toPx()
+            val stroke = 1.5.dp.toPx()
+            drawCircle(
+                color = Paper.copy(alpha = 0.9f),
+                radius = 10.dp.toPx(),
+                center = Offset(centerX, y),
+            )
+            drawLine(
+                color = accentColor,
+                start = Offset(centerX, y - length),
+                end = Offset(centerX, y + length),
+                strokeWidth = stroke,
+            )
+            drawLine(
+                color = accentColor,
+                start = Offset(centerX, y - length),
+                end = Offset(centerX - head, y - length + head),
+                strokeWidth = stroke,
+            )
+            drawLine(
+                color = accentColor,
+                start = Offset(centerX, y - length),
+                end = Offset(centerX + head, y - length + head),
+                strokeWidth = stroke,
+            )
+            drawLine(
+                color = accentColor,
+                start = Offset(centerX, y + length),
+                end = Offset(centerX - head, y + length - head),
+                strokeWidth = stroke,
+            )
+            drawLine(
+                color = accentColor,
+                start = Offset(centerX, y + length),
+                end = Offset(centerX + head, y + length - head),
+                strokeWidth = stroke,
+            )
+        }
+        drawDragIcon(top)
+        drawDragIcon(bottom)
+    }
+}
+
+private fun cropImageFrame(
+    canvasSize: Size,
+    imageWidth: Int,
+    imageHeight: Int,
+    fitImage: Boolean,
+): androidx.compose.ui.geometry.Rect {
+    if (imageWidth <= 0 || imageHeight <= 0) {
+        return androidx.compose.ui.geometry.Rect(0f, 0f, 0f, 0f)
+    }
+    val scale = if (fitImage) {
+        minOf(canvasSize.width / imageWidth, canvasSize.height / imageHeight)
+    } else {
+        canvasSize.width / imageWidth
+    }
+    val width = imageWidth * scale
+    val height = imageHeight * scale
+    val left = (canvasSize.width - width) / 2f
+    val top = (canvasSize.height - height) / 2f
+    return androidx.compose.ui.geometry.Rect(left, top, left + width, top + height)
+}
+
+internal fun draggedCropRange(
+    range: ClosedFloatingPointRange<Float>,
+    dragTop: Boolean,
+    fraction: Float,
+    minimumRange: Float,
+): ClosedFloatingPointRange<Float>? {
+    val value = fraction.coerceIn(0f, 1f)
+    return if (dragTop) {
+        if (range.endInclusive - value < minimumRange) null else value..range.endInclusive
+    } else {
+        if (value - range.start < minimumRange) null else range.start..value
     }
 }
 
@@ -1476,21 +1645,22 @@ private fun PreviewScreen(
                     Text("上下裁切", style = MaterialTheme.typography.titleMedium, color = Ink)
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        "保留 ${(crop.start * 100).roundToInt()}% ～ ${(crop.endInclusive * 100).roundToInt()}%",
+                        "拖曳圖片上的上下邊界線調整",
                         color = Quiet,
-                    )
-                    RangeSlider(
-                        value = crop,
-                        onValueChange = {
-                            if (it.endInclusive - it.start >= 0.02f) crop = it
-                        },
-                        valueRange = 0f..1f,
                     )
                 }
             }
         }
         itemsIndexed(sources, key = { _, source -> source.path }) { index, source ->
-            PreviewImage(source, index, sources.size, if (canOutput) crop else 0f..1f)
+            PreviewImage(
+                source = source,
+                index = index,
+                count = sources.size,
+                crop = if (canOutput) crop else 0f..1f,
+                cropEnabled = canOutput && !busy,
+                showCropOverlay = canOutput,
+                onCropChange = { crop = it },
+            )
         }
         if (canOutput) {
             item {
@@ -1580,8 +1750,10 @@ private fun PreviewImage(
     index: Int,
     count: Int,
     crop: ClosedFloatingPointRange<Float>,
+    cropEnabled: Boolean,
+    showCropOverlay: Boolean,
+    onCropChange: (ClosedFloatingPointRange<Float>) -> Unit,
 ) {
-    val accentColor = MaterialTheme.colorScheme.primary
     val loaded by produceState<LoadedPreview?>(null, source.path) {
         value = withContext(Dispatchers.IO) { loadPreview(source) }
     }
@@ -1624,17 +1796,17 @@ private fun PreviewImage(
                         modifier = Modifier.fillMaxWidth(),
                         contentScale = ContentScale.FillWidth,
                     )
-                    Canvas(Modifier.matchParentSize()) {
-                        val top = size.height * crop.start
-                        val bottom = size.height * crop.endInclusive
-                        drawRect(Paper.copy(alpha = 0.72f), size = Size(size.width, top))
-                        drawRect(
-                            Paper.copy(alpha = 0.72f),
-                            topLeft = Offset(0f, bottom),
-                            size = Size(size.width, size.height - bottom),
+                    if (showCropOverlay) {
+                        CropOverlay(
+                            modifier = Modifier.matchParentSize(),
+                            imageWidth = preview.bitmap.width,
+                            imageHeight = preview.bitmap.height,
+                            range = crop,
+                            minimumRange = 0.02f,
+                            fitImage = false,
+                            enabled = cropEnabled,
+                            onRangeChange = onCropChange,
                         )
-                        drawLine(accentColor, Offset(0f, top), Offset(size.width, top), 1.dp.toPx())
-                        drawLine(accentColor, Offset(0f, bottom), Offset(size.width, bottom), 1.dp.toPx())
                     }
                 }
             }
