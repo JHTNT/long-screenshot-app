@@ -51,6 +51,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RangeSlider
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Typography
@@ -1213,6 +1214,7 @@ private fun ManualStitchScreen(
     var seamIndex by remember(initialPlan) { mutableStateOf(firstUnconfirmed) }
     var selectedImage by remember(initialPlan) { mutableStateOf(firstUnconfirmed) }
     var previewMode by remember { mutableStateOf(ManualPreviewMode.Overlap) }
+    var hideSeamGuides by remember { mutableStateOf(false) }
     val seam = plan.seams[seamIndex]
     val previousSource = sources[seamIndex]
     val nextSource = sources[seamIndex + 1]
@@ -1298,6 +1300,7 @@ private fun ManualStitchScreen(
                             plan = plan,
                             seamIndex = seamIndex,
                             mode = previewMode,
+                            showGuides = !hideSeamGuides,
                             onDrag = drag,
                         )
                     }
@@ -1317,8 +1320,21 @@ private fun ManualStitchScreen(
                         modifier = Modifier.weight(1f),
                     )
                 }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text("隱藏接縫線", color = Ink)
+                    Switch(
+                        checked = hideSeamGuides,
+                        onCheckedChange = { hideSeamGuides = it },
+                        enabled = !busy,
+                    )
+                }
                 Text(
-                    "綠線：前張　橘線：後張　白線：重疊範圍・可拖曳後張上下移動",
+                    if (hideSeamGuides) "可拖曳後張上下移動"
+                    else "綠線：前張　橘線：後張　白線：重疊範圍・可拖曳後張上下移動",
                     modifier = Modifier.fillMaxWidth(),
                     color = Quiet,
                     fontSize = 12.sp,
@@ -1511,6 +1527,7 @@ private fun ManualSeamCanvas(
     plan: ManualStitchPlan,
     seamIndex: Int,
     mode: ManualPreviewMode,
+    showGuides: Boolean,
     onDrag: (Float) -> Unit,
 ) {
     var canvasSize by remember(plan.width) { mutableStateOf(IntSize.Zero) }
@@ -1622,19 +1639,21 @@ private fun ManualSeamCanvas(
                 ),
             )
         }
-        fun drawGuide(row: Long, color: Color, width: Float = 1.dp.toPx()) {
-            val y = (row - viewTop) * scale
-            if (y >= -width && y <= size.height + width) {
-                drawLine(color, Offset(0f, y), Offset(size.width, y), strokeWidth = width)
+        if (showGuides) {
+            fun drawGuide(row: Long, color: Color, width: Float = 1.dp.toPx()) {
+                val y = (row - viewTop) * scale
+                if (y >= -width && y <= size.height + width) {
+                    drawLine(color, Offset(0f, y), Offset(size.width, y), strokeWidth = width)
+                }
             }
-        }
-        drawGuide(previousCrop.top.toLong(), Color(0xFF62D6A7))
-        drawGuide(previousCrop.bottom.toLong(), Color(0xFF62D6A7))
-        drawGuide(nextTop, accentColor)
-        drawGuide(nextBottom, accentColor)
-        if (overlapEnd > overlapStart) {
-            drawGuide(overlapStart, Color.White, 1.5.dp.toPx())
-            drawGuide(overlapEnd, Color.White, 1.5.dp.toPx())
+            drawGuide(previousCrop.top.toLong(), Color(0xFF62D6A7))
+            drawGuide(previousCrop.bottom.toLong(), Color(0xFF62D6A7))
+            drawGuide(nextTop, accentColor)
+            drawGuide(nextBottom, accentColor)
+            if (overlapEnd > overlapStart) {
+                drawGuide(overlapStart, Color.White, 1.5.dp.toPx())
+                drawGuide(overlapEnd, Color.White, 1.5.dp.toPx())
+            }
         }
     }
 }

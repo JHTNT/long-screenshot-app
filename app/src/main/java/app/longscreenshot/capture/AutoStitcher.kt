@@ -268,12 +268,12 @@ internal object AutoStitcher {
         }
 
         val manualPlan = ManualStitcher.initialPlan(width, height, seams)
-        val firstLow = seams.indexOfFirst { !it.confident }
-        if (firstLow >= 0) {
+        val lowConfidenceCount = seams.count { !it.confident }
+        if (lowConfidenceCount > 0) {
             return Result(
                 output = null,
                 seams = seams,
-                message = "第 ${firstLow + 1} 個接縫：${seams[firstLow].reason.message}",
+                message = "有 $lowConfidenceCount 個接縫需要確認",
                 manualPlan = manualPlan,
             )
         }
