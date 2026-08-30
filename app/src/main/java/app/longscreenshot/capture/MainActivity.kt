@@ -13,6 +13,7 @@ import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.ActivityResultLauncher
@@ -117,6 +118,17 @@ private enum class PermissionStep { Overlay, Notification }
 
 private enum class ManualPreviewMode { Overlap, Composite }
 
+internal fun previousCaptureScreen(status: CaptureStatus): CaptureStatus? = when (status) {
+    is CaptureStatus.SelectingRegion -> CaptureStatus.Reviewing(status.count)
+    is CaptureStatus.Stitching -> CaptureStatus.SelectingRegion(status.count)
+    is CaptureStatus.Failed -> if (status.retainedCount > 0) {
+        CaptureStatus.Reviewing(status.retainedCount)
+    } else {
+        CaptureStatus.Idle
+    }
+    else -> null
+}
+
 class MainActivity : ComponentActivity() {
     private var permissionStep by mutableStateOf<PermissionStep?>(null)
     private var notificationAsked = false
@@ -125,6 +137,8 @@ class MainActivity : ComponentActivity() {
     private var outputBusy by mutableStateOf(false)
     private var outputMessage by mutableStateOf<String?>(null)
     private var accent by mutableStateOf(AccentPresets.first())
+    private var stitchGeneration = 0
+    private val editBackStack = ArrayDeque<CaptureStatus>()
 
     private lateinit var overlayLauncher: ActivityResultLauncher<Intent>
     private lateinit var notificationLauncher: ActivityResultLauncher<String>
@@ -167,6 +181,10 @@ class MainActivity : ComponentActivity() {
         handleIntent(intent)
         setContent {
             LongScreenshotTheme(accent) {
+                BackHandler(
+                    enabled = permissionStep != null || CaptureSession.status !is CaptureStatus.Idle,
+                    onBack = ::navigateBack,
+                )
                 App(
                     status = CaptureSession.status,
                     permissionStep = permissionStep,
@@ -180,11 +198,13 @@ class MainActivity : ComponentActivity() {
                         homeMessage = null
                         outputMessage = null
                         notificationAsked = false
+                        editBackStack.clear()
                         continuePermissionFlow()
                     },
                     onPermission = ::requestCurrentPermission,
                     onFinish = { startService(CaptureService.actionIntent(this, CaptureService.ACTION_FINISH)) },
                     onDelete = { startService(CaptureService.deleteIntent(this, it)) },
+                    onReviewDelete = ::deleteReviewedSource,
                     onRegionConfirm = ::stitchSelectedRegion,
                     onManual = ::openManualEditor,
                     onManualApply = ::applyManualPlan,
@@ -238,6 +258,55 @@ class MainActivity : ComponentActivity() {
         if (intent?.action == CaptureService.ACTION_CONFIRM_CANCEL) showCancelDialog = true
     }
 
+    private fun navigateBack() {
+        if (permissionStep != null) {
+            permissionStep = null
+            CaptureSession.status = CaptureStatus.Idle
+            return
+        }
+        val status = CaptureSession.status
+        when (status) {
+            CaptureStatus.Starting -> {
+                startService(CaptureService.actionIntent(this, CaptureService.ACTION_CANCEL))
+                CaptureSession.status = CaptureStatus.Idle
+            }
+            is CaptureStatus.Capturing -> moveTaskToBack(true)
+            is CaptureStatus.Reviewing -> showCancelDialog = true
+            is CaptureStatus.Stitching -> {
+                stitchGeneration += 1
+                CaptureSession.status = checkNotNull(previousCaptureScreen(status))
+            }
+            is CaptureStatus.Manual -> {
+                if (outputBusy) {
+                    stitchGeneration += 1
+                    outputBusy = false
+                }
+                returnToPreviousEdit(status.count)
+            }
+            is CaptureStatus.Finished -> if (!outputBusy) returnToPreviousEdit(status.count)
+            is CaptureStatus.SelectingRegion, is CaptureStatus.Failed ->
+                CaptureSession.status = checkNotNull(previousCaptureScreen(status))
+            CaptureStatus.Idle -> Unit
+        }
+    }
+
+    private fun returnToPreviousEdit(count: Int) {
+        CaptureSession.status = if (editBackStack.isEmpty()) CaptureStatus.SelectingRegion(count)
+        else editBackStack.removeLast()
+    }
+
+    private fun deleteReviewedSource(index: Int) {
+        val reviewing = CaptureSession.status as? CaptureStatus.Reviewing ?: return
+        if (!CaptureSession.deleteSource(index, reviewing.count)) {
+            CaptureSession.status = reviewing.copy(message = "刪除失敗，截圖仍保留。")
+            return
+        }
+        CaptureSession.status = CaptureStatus.Reviewing(
+            reviewing.count - 1,
+            if (reviewing.count == 1) "目前沒有已擷取的圖片。" else null,
+        )
+    }
+
     private fun continuePermissionFlow() {
         if (!Settings.canDrawOverlays(this)) {
             permissionStep = PermissionStep.Overlay
@@ -278,6 +347,8 @@ class MainActivity : ComponentActivity() {
 
     private fun stitchSelectedRegion(range: ClosedFloatingPointRange<Float>) {
         val selecting = CaptureSession.status as? CaptureStatus.SelectingRegion ?: return
+        val generation = ++stitchGeneration
+        val operationTarget = CaptureSession.resultFile().resolveSibling("result-$generation.png")
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(CaptureSession.sourceFile(1).path, bounds)
         if (bounds.outHeight <= 0) {
@@ -292,12 +363,23 @@ class MainActivity : ComponentActivity() {
             val result = runCatching {
                 AutoStitcher.stitch(
                     sources = (1..selecting.count).map(CaptureSession::sourceFile),
-                    target = CaptureSession.resultFile(),
+                    target = operationTarget,
                     region = region,
                 )
             }
                 runOnUiThread {
-                CaptureSession.status = result.fold(
+                if (generation != stitchGeneration || CaptureSession.status !is CaptureStatus.Stitching) {
+                    operationTarget.delete()
+                    return@runOnUiThread
+                }
+                editBackStack.addLast(selecting)
+                val committed = result.map { auto ->
+                    val output = auto.output?.let { file ->
+                        if (file == operationTarget) promoteResult(file) else file
+                    }
+                    auto.copy(output = output)
+                }
+                CaptureSession.status = committed.fold(
                     onSuccess = {
                         CaptureStatus.Finished(
                             selecting.count,
@@ -321,6 +403,7 @@ class MainActivity : ComponentActivity() {
     private fun openManualEditor() {
         val finished = CaptureSession.status as? CaptureStatus.Finished ?: return
         val plan = finished.manualPlan ?: return
+        editBackStack.addLast(finished)
         CaptureSession.status = CaptureStatus.Manual(
             finished.count,
             plan,
@@ -332,18 +415,26 @@ class MainActivity : ComponentActivity() {
         val editing = CaptureSession.status as? CaptureStatus.Manual ?: return
         if (outputBusy || !plan.isReady()) return
         outputBusy = true
+        val generation = ++stitchGeneration
+        val operationTarget = CaptureSession.resultFile().resolveSibling("result-$generation.png")
         Thread({
             val result = runCatching {
                 ManualStitcher.stitch(
                     sources = (1..editing.count).map(CaptureSession::sourceFile),
-                    target = CaptureSession.resultFile(),
+                    target = operationTarget,
                     plan = plan,
                 )
             }
             runOnUiThread {
+                if (generation != stitchGeneration || CaptureSession.status !is CaptureStatus.Manual) {
+                    operationTarget.delete()
+                    return@runOnUiThread
+                }
                 outputBusy = false
-                CaptureSession.status = result.fold(
+                val committed = result.map(::promoteResult)
+                CaptureSession.status = committed.fold(
                     onSuccess = {
+                        editBackStack.addLast(CaptureStatus.Manual(editing.count, plan))
                         CaptureStatus.Finished(
                             editing.count,
                             it,
@@ -361,6 +452,17 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }, "manual-stitch").start()
+    }
+
+    private fun promoteResult(candidate: java.io.File): java.io.File {
+        val target = CaptureSession.resultFile()
+        if (candidate == target) return target
+        java.nio.file.Files.move(
+            candidate.toPath(),
+            target.toPath(),
+            java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+        )
+        return target
     }
 
     private fun runOutput(
@@ -404,6 +506,7 @@ private fun App(
     onPermission: () -> Unit,
     onFinish: () -> Unit,
     onDelete: (Int) -> Unit,
+    onReviewDelete: (Int) -> Unit,
     onRegionConfirm: (ClosedFloatingPointRange<Float>) -> Unit,
     onManual: () -> Unit,
     onManualApply: (ManualStitchPlan) -> Unit,
@@ -424,6 +527,15 @@ private fun App(
             )
             CaptureStatus.Starting -> CenterStatus("正在準備", "即將顯示懸浮截圖按鈕。")
             is CaptureStatus.Capturing -> CapturingScreen(target, onFinish, onCancel, onDelete)
+            is CaptureStatus.Reviewing -> CapturingScreen(
+                status = CaptureStatus.Capturing(target.count, target.message),
+                onFinish = {
+                    if (target.count > 0) CaptureSession.status = CaptureStatus.SelectingRegion(target.count)
+                },
+                onCancel = onCancel,
+                onDelete = onReviewDelete,
+                active = false,
+            )
             is CaptureStatus.SelectingRegion -> RegionSelectionScreen(
                 source = CaptureSession.sourceFile(1),
                 onConfirm = onRegionConfirm,
@@ -686,19 +798,21 @@ private fun CapturingScreen(
     onFinish: () -> Unit,
     onCancel: () -> Unit,
     onDelete: (Int) -> Unit,
+    active: Boolean = true,
 ) {
     var deleteIndex by remember { mutableStateOf<Int?>(null) }
 
     Column(
         Modifier.fillMaxSize().safeDrawingPadding().padding(20.dp),
     ) {
-        AppHeader("擷取中")
+        AppHeader(if (active) "擷取中" else "已完成擷取")
         Spacer(Modifier.height(28.dp))
         Column {
             Text("已擷取 ${status.count} 張", style = MaterialTheme.typography.titleLarge, color = Ink)
             Spacer(Modifier.height(10.dp))
             Text(
-                status.message ?: "切回要截圖的 App 繼續擷取。",
+                status.message ?: if (active) "切回要截圖的 App 繼續擷取。"
+                else "可檢查截圖後再次進入區域選擇。",
                 style = MaterialTheme.typography.bodyLarge,
                 color = Quiet,
             )
@@ -730,6 +844,7 @@ private fun CapturingScreen(
         Column {
             Button(
                 onClick = onFinish,
+                enabled = active || status.count > 0,
                 modifier = Modifier.fillMaxWidth().height(52.dp),
                 shape = RoundedCornerShape(10.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Ink),

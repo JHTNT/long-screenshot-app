@@ -10,6 +10,7 @@ sealed interface CaptureStatus {
     data object Idle : CaptureStatus
     data object Starting : CaptureStatus
     data class Capturing(val count: Int, val message: String? = null) : CaptureStatus
+    data class Reviewing(val count: Int, val message: String? = null) : CaptureStatus
     data class SelectingRegion(val count: Int) : CaptureStatus
     data class Stitching(val count: Int) : CaptureStatus
     data class Finished(
