@@ -110,6 +110,8 @@ private val AccentPresets = listOf(
     Color(0xFFB197FC),
     Color(0xFFF783AC),
 )
+private const val PreferencesName = "appearance"
+private const val AccentPreference = "accent"
 
 private enum class PermissionStep { Overlay, Notification }
 
@@ -131,6 +133,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        val preferences = getSharedPreferences(PreferencesName, MODE_PRIVATE)
+        accent = Color(preferences.getInt(AccentPreference, AccentPresets.first().toArgb()))
 
         if (!CaptureSession.cleanOrphans(this)) {
             homeMessage = "部分舊暫存無法清除，請稍後再試。"
@@ -168,7 +172,10 @@ class MainActivity : ComponentActivity() {
                     permissionStep = permissionStep,
                     homeMessage = homeMessage,
                     accent = accent,
-                    onAccentChange = { accent = it },
+                    onAccentChange = {
+                        accent = it
+                        preferences.edit().putInt(AccentPreference, it.toArgb()).apply()
+                    },
                     onStart = {
                         homeMessage = null
                         outputMessage = null
