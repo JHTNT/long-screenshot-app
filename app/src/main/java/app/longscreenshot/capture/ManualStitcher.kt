@@ -134,7 +134,10 @@ internal object ManualStitcher {
         val contentBottom = height - (proposals.maxOfOrNull { it.bottomCrop } ?: 0)
         require(contentBottom in 1..height) { "內容高度無效" }
         val defaultCrops = List(proposals.size + 1) { index ->
-            ManualCrop(0, if (index == proposals.size) height else contentBottom)
+            ManualCrop(
+                0,
+                if (index == proposals.size) height else proposals[index].seamBottom ?: contentBottom,
+            )
         }
         val defaultSeams = proposals.map { proposal ->
             ManualSeam(

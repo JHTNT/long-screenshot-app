@@ -24,6 +24,7 @@ internal data class StitchProposal(
     val secondBestGap: Double,
     val confident: Boolean,
     val reason: StitchReason,
+    val seamBottom: Int? = null,
 )
 
 internal data class LumaImage(
@@ -78,12 +79,14 @@ internal object StitchMatcher {
         val reverse = search(b, a, top, bottom)
         val zoneSpread = forward.zoneBest.maxOrNull()!! - forward.zoneBest.minOrNull()!!
         val exact = region != null && forward.best.score >= EXACT_SCORE && forward.gap >= EXACT_GAP
+        val seamBottom = stableSeamBottom(a, b, forward.best.shift, top, bottom)
         val reason = when {
             forward.best.texture < MIN_TEXTURE -> StitchReason.LowTexture
             reverse.best.score >= MIN_SCORE && reverse.best.score > forward.best.score + MIN_GAP ->
                 StitchReason.ReverseScroll
             forward.best.score < MIN_SCORE -> StitchReason.NoOverlap
             forward.gap < MIN_GAP && !exact -> StitchReason.Ambiguous
+            seamBottom == null -> StitchReason.Inconsistent
             !exact && (forward.best.zoneScores.count { it >= MIN_ZONE_SCORE } < 2 || zoneSpread > 2) ->
                 StitchReason.Inconsistent
             else -> StitchReason.Matched
@@ -96,6 +99,7 @@ internal object StitchMatcher {
             secondBestGap = forward.gap,
             confident = reason == StitchReason.Matched,
             reason = reason,
+            seamBottom = seamBottom,
         )
     }
 
@@ -184,7 +188,7 @@ internal object StitchMatcher {
         if (rows.isEmpty()) return Score(shift, 0.0, 0.0, DoubleArray(3))
         val kept = rows
             .sortedByDescending { it.first.average() }
-            .take(max(1, (rows.size * 0.8).toInt()))
+            .take(max(1, (rows.size * 0.55).toInt()))
         val zones = DoubleArray(3) { zone -> kept.map { it.first[zone] }.average() }
         return Score(
             shift,
@@ -192,6 +196,34 @@ internal object StitchMatcher {
             kept.count { it.second >= 0.05 }.toDouble() / kept.size,
             zones,
         )
+    }
+
+    private fun stableSeamBottom(
+        a: LumaImage,
+        b: LumaImage,
+        shift: Int,
+        top: Int,
+        bottom: Int,
+    ): Int? {
+        val xStep = max(1, a.width / 180)
+        var stableRows = 0
+        for (aY in a.height - bottom - 1 downTo top + shift) {
+            var difference = 0L
+            var count = 0
+            var x = 0
+            while (x < a.width) {
+                difference += abs(a[x, aY] - b[x, aY - shift])
+                count += 1
+                x += xStep
+            }
+            if (difference.toDouble() / count <= 12.0) {
+                stableRows += 1
+                if (stableRows >= 6) return aY + stableRows
+            } else {
+                stableRows = 0
+            }
+        }
+        return null
     }
 
     private fun fixedBottom(a: LumaImage, b: LumaImage, minimum: Int): Int {

@@ -119,6 +119,42 @@ class StitchMatcherTest {
     }
 
     @Test
+    fun keepsOneFrameWhenVideoChangesAcrossTheBottomOfTheOverlap() {
+        val width = 40
+        val height = 200
+        val shift = 60
+        val videoTop = 130
+        fun pixels(offset: Int) = ByteArray(width * height) { index ->
+            val x = index % width
+            val y = index / width + offset
+            ((x * 37 + y * 19 + x * y % 71) and 0xff).toByte()
+        }
+        val first = pixels(0)
+        val second = pixels(shift)
+        for (globalY in videoTop until height) {
+            for (x in 0 until width) {
+                first[globalY * width + x] = ((x * 11 + globalY * 7) and 0xff).toByte()
+                second[(globalY - shift) * width + x] =
+                    ((x * 29 + globalY * 13 + 80) and 0xff).toByte()
+            }
+        }
+
+        val seam = StitchMatcher.find(
+            LumaImage(width, height, first),
+            LumaImage(width, height, second),
+            region = VerticalRegion(0, height),
+        )
+
+        assertTrue(seam.toString(), seam.confident)
+        assertEquals(shift, seam.shift)
+        assertEquals(videoTop, seam.seamBottom)
+        assertEquals(
+            videoTop,
+            ManualStitcher.initialPlan(width, height, listOf(seam)).crops.first().bottom,
+        )
+    }
+
+    @Test
     fun acceptsNearExactOverlapInRepeatedRegion() {
         val width = 60
         val height = 240
