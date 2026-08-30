@@ -1,0 +1,5 @@
+- Read relevant docs and code before changing anything.
+- When docs and implementation disagree, use tests and git history to determine current intent; do not guess.
+- Keep docs aligned with stable product behavior and important architectural decisions.
+- Do not implement Planned / Ideas unless explicitly requested.
+- Prefer the smallest correct change and avoid unrelated refactors or speculative abstractions.
