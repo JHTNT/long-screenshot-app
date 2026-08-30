@@ -1398,13 +1398,13 @@ private fun ManualStitchScreen(
                 Spacer(Modifier.height(6.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     CompactChoice(
-                        label = "前張・第 ${seamIndex + 1} 張",
+                        label = "第 ${seamIndex + 1} 張圖片",
                         selected = selectedImage == seamIndex,
                         onClick = { selectedImage = seamIndex },
                         modifier = Modifier.weight(1f),
                     )
                     CompactChoice(
-                        label = "後張・第 ${seamIndex + 2} 張",
+                        label = "第 ${seamIndex + 2} 張圖片",
                         selected = selectedImage == seamIndex + 1,
                         onClick = { selectedImage = seamIndex + 1 },
                         modifier = Modifier.weight(1f),
