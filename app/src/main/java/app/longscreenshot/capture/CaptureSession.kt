@@ -6,8 +6,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import java.io.File
 
-enum class CaptureMode { General, ContentRegion }
-
 sealed interface CaptureStatus {
     data object Idle : CaptureStatus
     data object Starting : CaptureStatus
@@ -39,9 +37,6 @@ object CaptureSession {
         internal set
 
     var systemBottomInset = 0
-        internal set
-
-    var mode = CaptureMode.General
         internal set
 
     fun create(context: Context): File {
@@ -83,7 +78,6 @@ object CaptureSession {
             directory = null
             systemTopInset = 0
             systemBottomInset = 0
-            mode = CaptureMode.General
             status = CaptureStatus.Idle
         }
         return deleted

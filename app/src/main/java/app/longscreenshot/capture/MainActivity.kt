@@ -122,7 +122,6 @@ class MainActivity : ComponentActivity() {
     private var showCancelDialog by mutableStateOf(false)
     private var outputBusy by mutableStateOf(false)
     private var outputMessage by mutableStateOf<String?>(null)
-    private var selectedMode by mutableStateOf(CaptureMode.General)
     private var accent by mutableStateOf(AccentPresets.first())
 
     private lateinit var overlayLauncher: ActivityResultLauncher<Intent>
@@ -157,7 +156,7 @@ class MainActivity : ComponentActivity() {
             CaptureSession.status = CaptureStatus.Starting
             ContextCompat.startForegroundService(
                 this,
-                CaptureService.startIntent(this, result.resultCode, data, selectedMode),
+                CaptureService.startIntent(this, result.resultCode, data),
             )
         }
 
@@ -168,8 +167,6 @@ class MainActivity : ComponentActivity() {
                     status = CaptureSession.status,
                     permissionStep = permissionStep,
                     homeMessage = homeMessage,
-                    mode = selectedMode,
-                    onModeChange = { selectedMode = it },
                     accent = accent,
                     onAccentChange = { accent = it },
                     onStart = {
@@ -394,8 +391,6 @@ private fun App(
     status: CaptureStatus,
     permissionStep: PermissionStep?,
     homeMessage: String?,
-    mode: CaptureMode,
-    onModeChange: (CaptureMode) -> Unit,
     accent: Color,
     onAccentChange: (Color) -> Unit,
     onStart: () -> Unit,
@@ -416,8 +411,6 @@ private fun App(
             is PermissionStep -> PermissionScreen(target, onPermission)
             CaptureStatus.Idle -> HomeScreen(
                 homeMessage,
-                mode,
-                onModeChange,
                 accent,
                 onAccentChange,
                 onStart,
@@ -462,8 +455,6 @@ private fun App(
 @Composable
 private fun HomeScreen(
     message: String?,
-    mode: CaptureMode,
-    onModeChange: (CaptureMode) -> Unit,
     accent: Color,
     onAccentChange: (Color) -> Unit,
     onStart: () -> Unit,
@@ -483,29 +474,8 @@ private fun HomeScreen(
                 style = MaterialTheme.typography.bodyLarge,
                 color = Quiet,
             )
-            Spacer(Modifier.height(24.dp))
-            Text("拼接模式", style = MaterialTheme.typography.titleMedium, color = Ink)
             Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FormatButton(
-                    label = "一般",
-                    detail = "自動判斷",
-                    selected = mode == CaptureMode.General,
-                    onClick = { onModeChange(CaptureMode.General) },
-                    modifier = Modifier.weight(1f),
-                )
-                FormatButton(
-                    label = "指定區域",
-                    detail = "框選內容",
-                    selected = mode == CaptureMode.ContentRegion,
-                    onClick = { onModeChange(CaptureMode.ContentRegion) },
-                    modifier = Modifier.weight(1f),
-                )
-            }
-            if (mode == CaptureMode.ContentRegion) {
-                Spacer(Modifier.height(10.dp))
-                Text("完成擷取後，選擇拼接時要用於判斷的範圍。", color = Quiet)
-            }
+            Text("完成擷取後，選擇拼接時要用於判斷的範圍。", color = Quiet)
             if (message != null) {
                 Spacer(Modifier.height(14.dp))
                 Text(message, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodyMedium)

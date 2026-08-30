@@ -105,9 +105,6 @@ class CaptureService : Service() {
             captureHeight = bounds.height()
             densityDpi = resources.configuration.densityDpi
             CaptureSession.create(this)
-            CaptureSession.mode = intent.getStringExtra(EXTRA_MODE)
-                ?.let { runCatching { CaptureMode.valueOf(it) }.getOrNull() }
-                ?: CaptureMode.General
             updateSystemInsets()
             replaceImageReader(captureWidth, captureHeight)
             virtualDisplay = projection.createVirtualDisplay(
@@ -264,47 +261,8 @@ class CaptureService : Service() {
             stopSelf()
             return
         }
-        if (CaptureSession.mode == CaptureMode.ContentRegion) {
-            CaptureSession.status = CaptureStatus.SelectingRegion(count)
-            stopSelf()
-            return
-        }
-        if (count == 1) {
-            CaptureSession.status = CaptureStatus.Finished(
-                count,
-                CaptureSession.sourceFile(1),
-                "單張圖片不需拼接",
-            )
-            stopSelf()
-            return
-        }
-
-        CaptureSession.status = CaptureStatus.Stitching(count)
-        captureHandler.post {
-            val result = runCatching {
-                AutoStitcher.stitch(
-                    sources = (1..count).map(CaptureSession::sourceFile),
-                    target = CaptureSession.resultFile(),
-                    topInset = CaptureSession.systemTopInset,
-                    bottomInset = CaptureSession.systemBottomInset,
-                )
-            }
-            mainHandler.post {
-                CaptureSession.status = result.fold(
-                    onSuccess = {
-                        CaptureStatus.Finished(count, it.output, it.message, it.manualPlan)
-                    },
-                    onFailure = {
-                        CaptureStatus.Finished(
-                            count,
-                            null,
-                            it.message ?: "自動拼接失敗，來源圖片已保留",
-                        )
-                    },
-                )
-                stopSelf()
-            }
-        }
+        CaptureSession.status = CaptureStatus.SelectingRegion(count)
+        stopSelf()
     }
 
     private fun cancelCapture() {
@@ -583,18 +541,16 @@ class CaptureService : Service() {
         private const val ACTION_DELETE = "app.longscreenshot.capture.DELETE"
         private const val EXTRA_RESULT_DATA = "projection-result-data"
         private const val EXTRA_RESULT_CODE = "projection-result-code"
-        private const val EXTRA_MODE = "capture-mode"
         private const val EXTRA_INDEX = "capture-index"
         private const val CHANNEL_ID = "capture"
         private const val NOTIFICATION_ID = 1001
         private const val BADGE_ID = 42
 
-        fun startIntent(context: Context, resultCode: Int, data: Intent, mode: CaptureMode) =
+        fun startIntent(context: Context, resultCode: Int, data: Intent) =
             Intent(context, CaptureService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_RESULT_DATA, data)
                 putExtra(EXTRA_RESULT_CODE, resultCode)
-                putExtra(EXTRA_MODE, mode.name)
             }
 
         fun actionIntent(context: Context, actionName: String) =
