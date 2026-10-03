@@ -88,6 +88,22 @@ data class ManualStitchPlan(
         return copy(crops = nextCrops, seams = nextSeams)
     }
 
+    fun resetSeam(index: Int): ManualStitchPlan {
+        require(index in seams.indices)
+        var reset = this
+        for (imageIndex in index..index + 1) {
+            if (reset.crops[imageIndex] != defaultCrops[imageIndex]) {
+                reset = reset.withCrop(imageIndex, defaultCrops[imageIndex])
+            }
+        }
+        val nextSeams = reset.seams.toMutableList()
+        nextSeams[index] = defaultSeams[index]
+        if (seams[index].skipped != defaultSeams[index].skipped && index < seams.lastIndex) {
+            nextSeams[index + 1] = nextSeams[index + 1].copy(confirmed = false)
+        }
+        return reset.copy(seams = nextSeams)
+    }
+
     fun keepDuplicate(index: Int): ManualStitchPlan {
         require(index in seams.indices && seams[index].skipped)
         val next = seams.toMutableList()
@@ -106,6 +122,16 @@ data class ManualStitchPlan(
         ManualStitcher.validate(this).isValid && seams.all { it.skipped || it.confirmed }
 }
 
+/** Review forward, then wrap around because cropping can invalidate an earlier seam. */
+internal fun nextManualSeamToReview(plan: ManualStitchPlan, currentIndex: Int): Int? {
+    val errors = ManualStitcher.validate(plan).seamErrors
+    return (1 until plan.seams.size)
+        .map { (currentIndex + it) % plan.seams.size }
+        .firstOrNull { index ->
+            val seam = plan.seams[index]
+            !seam.skipped && (!seam.confirmed || errors[index] != null)
+        }
+}
 internal data class ManualValidation(
     val seamErrors: List<String?>,
 ) {

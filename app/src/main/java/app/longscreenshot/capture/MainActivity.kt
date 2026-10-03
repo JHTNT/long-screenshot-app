@@ -21,11 +21,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -33,23 +35,36 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RangeSlider
+import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.PrimaryTabRow
+import androidx.compose.material3.Tab
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -57,12 +72,14 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
@@ -1200,8 +1217,7 @@ private fun ManualStitchScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text("沒有可調整的接縫", color = Ink)
-            Spacer(Modifier.height(16.dp))
-            OutlinedButton(onClick = onCancel) { Text("返回") }
+            TextButton(onClick = onCancel) { Text("銷毀、不保存") }
         }
         return
     }
@@ -1214,7 +1230,20 @@ private fun ManualStitchScreen(
     var seamIndex by remember(initialPlan) { mutableStateOf(firstUnconfirmed) }
     var selectedImage by remember(initialPlan) { mutableStateOf(firstUnconfirmed) }
     var previewMode by remember { mutableStateOf(ManualPreviewMode.Overlap) }
-    var hideSeamGuides by remember { mutableStateOf(false) }
+    var showGuides by remember { mutableStateOf(false) }
+    var cropMode by remember { mutableStateOf(false) }
+    var previewSize by remember { mutableStateOf(IntSize.Zero) }
+    var previewViewTop by remember(initialPlan, seamIndex) { mutableStateOf<Float?>(null) }
+    var menuExpanded by remember { mutableStateOf(false) }
+    var showDetails by remember { mutableStateOf(false) }
+    var showResetDialog by remember(initialPlan, seamIndex) { mutableStateOf(false) }
+    val snackbar = remember { SnackbarHostState() }
+    LaunchedEffect(message, busy) {
+        snackbar.currentSnackbarData?.dismiss()
+        if (message != null && !busy) {
+            snackbar.showSnackbar(message, withDismissAction = true, duration = SnackbarDuration.Long)
+        }
+    }
     val seam = plan.seams[seamIndex]
     val previousSource = sources[seamIndex]
     val nextSource = sources[seamIndex + 1]
@@ -1224,269 +1253,396 @@ private fun ManualStitchScreen(
     val next by produceState<LoadedPreview?>(null, nextSource.path) {
         value = withContext(Dispatchers.IO) { loadPreview(nextSource) }
     }
-    val previousPreview = previous
-    val nextPreview = next
     val validation = ManualStitcher.validate(plan)
     val seamError = validation.seamErrors[seamIndex]
+    val otherPending = nextManualSeamToReview(plan, seamIndex)
+    val remaining = plan.seams.indices.count {
+        !plan.seams[it].skipped && (!plan.seams[it].confirmed || validation.seamErrors[it] != null)
+    }
+    val selectSeam: (Int) -> Unit = {
+        seamIndex = it
+        selectedImage = it
+        cropMode = false
+    }
+    val crop = plan.crops[selectedImage]
+    val updateCrop: (ManualCrop) -> Unit = {
+        if (!busy && it != plan.crops[selectedImage]) plan = plan.withCrop(selectedImage, it)
+    }
     val drag by rememberUpdatedState<(Float) -> Unit> { delta ->
         val rows = delta.roundToInt()
         if (rows != 0 && !busy) plan = plan.withShift(seamIndex, rows)
     }
 
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().safeDrawingPadding(),
-        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        item {
-            AppHeader("手動調整")
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "接縫 ${seamIndex + 1}／${plan.seams.size}",
-                style = MaterialTheme.typography.titleLarge,
-                color = Ink,
-            )
-            Text(
-                if (seam.skipped) "第 ${seamIndex + 2} 張與前一張幾乎相同，已略過"
-                else if (seam.confirmed) "已確認"
-                else "需要確認",
-                color = if (seam.confirmed) MaterialTheme.colorScheme.primary else Quiet,
-            )
-        }
-        if (message != null) {
-            item {
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
-                    shape = RoundedCornerShape(10.dp),
+    BoxWithConstraints(Modifier.fillMaxSize().safeDrawingPadding()) {
+        val previewHeight = (maxHeight * 0.40f).coerceIn(120.dp, 360.dp)
+        val compact = maxHeight < 700.dp || androidx.compose.ui.platform.LocalDensity.current.fontScale > 1.25f
+        Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("手動拼接", style = MaterialTheme.typography.titleLarge, color = Ink)
+                Spacer(Modifier.weight(1f))
+                IconButton(
+                    onClick = { showResetDialog = true },
+                    enabled = !busy,
+                    modifier = Modifier.semantics { contentDescription = "重置位置與裁切" },
                 ) {
-                    Text(message, Modifier.padding(12.dp), color = MaterialTheme.colorScheme.primary)
+                    Icon(
+                        painter = painterResource(R.drawable.ic_reset),
+                        contentDescription = null,
+                        modifier = Modifier.size(24.dp),
+                        tint = if (busy) Ink.copy(alpha = 0.38f) else Ink,
+                    )
                 }
-            }
-        }
-        item {
-            if (seam.skipped) {
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    color = Color(0xFF20231E),
-                    shape = RoundedCornerShape(10.dp),
-                ) {
-                    Column(Modifier.padding(14.dp)) {
-                        Text("這張圖片目前不加入成品。", color = Ink)
-                        Spacer(Modifier.height(10.dp))
-                        OutlinedButton(
-                            onClick = { plan = plan.keepDuplicate(seamIndex) },
-                            enabled = !busy,
-                            modifier = Modifier.fillMaxWidth().height(40.dp),
-                        ) { Text("保留這張") }
+                Box {
+                    IconButton(
+                        onClick = { menuExpanded = true },
+                        enabled = !busy,
+                        modifier = Modifier.semantics { contentDescription = "更多拼接選項" },
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_more_horiz),
+                            contentDescription = null,
+                            modifier = Modifier.size(24.dp),
+                            tint = if (busy) Ink.copy(alpha = 0.38f) else Ink,
+                        )
                     }
-                }
-            } else {
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    color = Color(0xFF20231E),
-                    shape = RoundedCornerShape(10.dp),
-                ) {
-                    when {
-                        previous == null || next == null -> Box(
-                            Modifier.fillMaxWidth().height(320.dp),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-                        }
-                        else -> ManualSeamCanvas(
-                            previous = checkNotNull(previousPreview),
-                            next = checkNotNull(nextPreview),
-                            plan = plan,
-                            seamIndex = seamIndex,
-                            mode = previewMode,
-                            showGuides = !hideSeamGuides,
-                            onDrag = drag,
+                    DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                        DropdownMenuItem(
+                            text = { Text("拼接說明與數值") },
+                            onClick = { menuExpanded = false; showDetails = true },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("銷毀、不保存", color = MaterialTheme.colorScheme.primary) },
+                            onClick = { menuExpanded = false; onCancel() },
                         )
                     }
                 }
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    CompactChoice(
-                        label = "重疊顯示",
-                        selected = previewMode == ManualPreviewMode.Overlap,
-                        onClick = { previewMode = ManualPreviewMode.Overlap },
-                        modifier = Modifier.weight(1f),
-                    )
-                    CompactChoice(
-                        label = "合成顯示",
-                        selected = previewMode == ManualPreviewMode.Composite,
-                        onClick = { previewMode = ManualPreviewMode.Composite },
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Text("隱藏接縫線", color = Ink)
-                    Switch(
-                        checked = hideSeamGuides,
-                        onCheckedChange = { hideSeamGuides = it },
-                        enabled = !busy,
-                    )
-                }
-                Text(
-                    if (hideSeamGuides) "可拖曳後張上下移動"
-                    else "綠線：前張　橘線：後張　白線：重疊範圍・可拖曳後張上下移動",
-                    modifier = Modifier.fillMaxWidth(),
-                    color = Quiet,
-                    fontSize = 12.sp,
-                    textAlign = TextAlign.Center,
-                )
             }
-        }
-        if (!seam.skipped) {
-            item {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedButton(
+                    onClick = { selectSeam(seamIndex - 1) },
+                    enabled = !busy && seamIndex > 0,
+                    modifier = Modifier.size(48.dp).semantics { contentDescription = "上一處接縫" },
+                    shape = RoundedCornerShape(14.dp),
+                    contentPadding = PaddingValues(0.dp),
+                ) { Text("‹", fontSize = 26.sp) }
+                Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("接縫 ${seamIndex + 1}／${plan.seams.size}", color = Ink,
+                        style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "第 ${seamIndex + 1}、${seamIndex + 2} 張之間 · " + when {
+                            seam.skipped -> "重複圖片已略過"
+                            seamError != null -> "需要調整"
+                            seam.confirmed -> "已確認"
+                            else -> "待確認"
+                        },
+                        color = Quiet, style = MaterialTheme.typography.labelMedium, textAlign = TextAlign.Center,
+                    )
+                }
+                OutlinedButton(
+                    onClick = { selectSeam(seamIndex + 1) },
+                    enabled = !busy && seamIndex < plan.seams.lastIndex,
+                    modifier = Modifier.size(48.dp).semantics { contentDescription = "下一處接縫" },
+                    shape = RoundedCornerShape(14.dp),
+                    contentPadding = PaddingValues(0.dp),
+                ) { Text("›", fontSize = 26.sp) }
+            }
+            Column(
+                Modifier.weight(1f).then(if (compact) Modifier.verticalScroll(rememberScrollState()) else Modifier),
+            ) {
                 Surface(
-                    modifier = Modifier.fillMaxWidth().height(40.dp),
-                    color = if (seamError == null) {
-                        Color.Transparent
-                    } else {
-                        MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
-                    },
-                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth().height(previewHeight).onSizeChanged { previewSize = it },
+                    color = Color(0xFF20231E), shape = RoundedCornerShape(18.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
                 ) {
-                    Box(
-                        modifier = Modifier.fillMaxSize().padding(horizontal = 10.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        if (seamError != null) {
-                            Text(
-                                seamError,
-                                modifier = Modifier.fillMaxWidth(),
-                                color = MaterialTheme.colorScheme.primary,
-                                maxLines = 1,
-                                textAlign = TextAlign.Center,
-                            )
-                        }
-                    }
-                }
-            }
-        }
-        if (!seam.skipped) {
-            item {
-                Text(
-                    "位移 ${seam.shift} px・重疊 ${ManualStitcher.overlap(plan, seamIndex)} px",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = Ink,
-                )
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    listOf(-10 to "上移 10", -1 to "上移 1", 1 to "下移 1", 10 to "下移 10")
-                        .forEach { (delta, label) ->
-                            OutlinedButton(
-                                onClick = { plan = plan.withShift(seamIndex, delta) },
-                                enabled = !busy,
-                                modifier = Modifier.weight(1f).height(40.dp),
-                                contentPadding = PaddingValues(horizontal = 1.dp),
-                            ) { Text(label, fontSize = 11.sp) }
-                        }
-                }
-            }
-            item {
-                val crop = plan.crops[selectedImage]
-                val cropRange =
-                    (crop.top.toFloat() / plan.height)..(crop.bottom.toFloat() / plan.height)
-                Text("調整圖片裁切", style = MaterialTheme.typography.titleMedium, color = Ink)
-                Spacer(Modifier.height(6.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    CompactChoice(
-                        label = "第 ${seamIndex + 1} 張圖片",
-                        selected = selectedImage == seamIndex,
-                        onClick = { selectedImage = seamIndex },
-                        modifier = Modifier.weight(1f),
-                    )
-                    CompactChoice(
-                        label = "第 ${seamIndex + 2} 張圖片",
-                        selected = selectedImage == seamIndex + 1,
-                        onClick = { selectedImage = seamIndex + 1 },
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-                Text("保留 ${crop.top} ～ ${crop.bottom} px", color = Quiet)
-                RangeSlider(
-                    value = cropRange,
-                    onValueChange = { range ->
-                        if (!busy) {
-                            val top = (range.start * plan.height).roundToInt()
-                            val bottom = (range.endInclusive * plan.height).roundToInt()
-                            if (bottom - top >= 1) {
-                                plan = plan.withCrop(
-                                    selectedImage,
-                                    ManualCrop(
-                                        top.coerceIn(0, plan.height - 1),
-                                        bottom.coerceIn(1, plan.height),
-                                    ),
-                                )
+                    when {
+                        seam.skipped -> Column(
+                            modifier = Modifier.verticalScroll(rememberScrollState()).padding(24.dp),
+                            verticalArrangement = Arrangement.Center,
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Text("這張內容已經出現過", color = Ink, style = MaterialTheme.typography.titleMedium)
+                            Spacer(Modifier.height(8.dp))
+                            Text("第 ${seamIndex + 2} 張目前不加入成品。\n如果仍需要這張，可以保留後重新對齊。",
+                                color = Quiet, textAlign = TextAlign.Center)
+                            Spacer(Modifier.height(16.dp))
+                            OutlinedButton(onClick = { plan = plan.keepDuplicate(seamIndex) }, enabled = !busy) {
+                                Text("保留這張圖片")
                             }
                         }
+                        previous == null || next == null -> Box(contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator()
+                        }
+                        cropMode -> {
+                            val selected = checkNotNull(if (selectedImage == seamIndex) previous else next)
+                            val scale = manualPreviewScale(plan, previewSize.width)
+                            val imageTop = if (selectedImage == seamIndex) 0 else seam.shift
+                            val paddingPx = with(androidx.compose.ui.platform.LocalDensity.current) { 12.dp.roundToPx() }
+                            val cropScroll = remember(seamIndex, selectedImage, previewSize) {
+                                val viewTop = previewViewTop ?: manualSeamViewTop(
+                                    plan.height, plan.crops[seamIndex].bottom, previewSize.height / scale,
+                                )
+                                ScrollState(manualCropScroll(viewTop, imageTop, scale, paddingPx))
+                            }
+                            LaunchedEffect(cropScroll, imageTop, scale, paddingPx) {
+                                snapshotFlow { cropScroll.value }.collect { scroll ->
+                                    previewViewTop = manualCropViewTop(scroll, imageTop, scale, paddingPx)
+                                }
+                            }
+                            Box(Modifier.fillMaxSize().verticalScroll(cropScroll)) {
+                                Box(Modifier.padding(vertical = 12.dp)) {
+                                    Image(
+                                        bitmap = selected.bitmap.asImageBitmap(),
+                                        contentDescription = "第 ${selectedImage + 1} 張的裁切預覽",
+                                        modifier = Modifier.fillMaxWidth(), contentScale = ContentScale.FillWidth,
+                                    )
+                                    CropOverlay(
+                                        modifier = Modifier.matchParentSize(),
+                                        imageWidth = selected.bitmap.width, imageHeight = selected.bitmap.height,
+                                        range = (crop.top.toFloat() / plan.height)..(crop.bottom.toFloat() / plan.height),
+                                        minimumRange = 1f / plan.height, fitImage = false, enabled = !busy,
+                                        onRangeChange = { range ->
+                                            val top = (range.start * plan.height).roundToInt().coerceIn(0, plan.height - 1)
+                                            val bottom = (range.endInclusive * plan.height).roundToInt().coerceIn(top + 1, plan.height)
+                                            updateCrop(ManualCrop(top, bottom))
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                        else -> ManualSeamCanvas(
+                            previous = checkNotNull(previous), next = checkNotNull(next),
+                            plan = plan, seamIndex = seamIndex, mode = previewMode,
+                            showGuides = showGuides, onDrag = drag, viewportTop = previewViewTop,
+                            enabled = !busy && previewMode == ManualPreviewMode.Overlap,
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
+                }
+                Text(
+                    when {
+                        seam.skipped -> "略過重複圖片，避免成品出現相同內容。"
+                        cropMode -> "上下捲動查看圖片，拖曳邊界裁切暗色區域。"
+                        previewMode == ManualPreviewMode.Composite -> "檢查接合處的文字與圖案是否連續。"
+                        else -> "上下拖曳預覽，讓兩張圖的重複內容重合。"
                     },
-                    valueRange = 0f..1f,
-                    enabled = !busy,
+                    modifier = Modifier.padding(vertical = 8.dp),
+                    color = Quiet, style = MaterialTheme.typography.bodyMedium,
                 )
-                OutlinedButton(
-                    onClick = { plan = plan.resetImage(selectedImage) },
-                    enabled = !busy,
-                    modifier = Modifier.fillMaxWidth().height(36.dp),
-                ) { Text("還原這張") }
-            }
-        }
-        item {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = {
-                        seamIndex -= 1
-                        selectedImage = seamIndex
-                    },
-                    enabled = !busy && seamIndex > 0,
-                    modifier = Modifier.weight(1f).height(40.dp),
-                ) { Text("上一個") }
-                Button(
-                    onClick = { plan = plan.confirm(seamIndex) },
-                    enabled = !busy && !seam.skipped && !seam.confirmed && seamError == null,
-                    modifier = Modifier.weight(1.5f).height(44.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Ink),
-                ) { Text(if (seam.confirmed) "已確認" else "確認接縫") }
-                OutlinedButton(
-                    onClick = {
-                        seamIndex += 1
-                        selectedImage = seamIndex
-                    },
-                    enabled = !busy && seamIndex < plan.seams.lastIndex,
-                    modifier = Modifier.weight(1f).height(40.dp),
-                ) { Text("下一個") }
-            }
-        }
-        item {
-            if (!plan.isReady() && validation.message != null && seamError == null) {
-                Text(validation.message!!, color = Quiet)
-                Spacer(Modifier.height(8.dp))
-            }
-            Button(
-                onClick = { onApply(plan) },
-                enabled = !busy && plan.isReady(),
-                modifier = Modifier.fillMaxWidth().height(52.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Ink),
-            ) {
-                if (busy) {
-                    CircularProgressIndicator(Modifier.height(20.dp), color = Paper, strokeWidth = 2.dp)
-                } else {
-                    Text("套用並預覽", fontWeight = FontWeight.SemiBold)
+                if (!seam.skipped) {
+                    PrimaryTabRow(selectedTabIndex = if (cropMode) 1 else 0, containerColor = Paper) {
+                        Tab(selected = !cropMode, onClick = { cropMode = false }, enabled = !busy,
+                            text = { Text("對齊位置") })
+                        Tab(selected = cropMode, onClick = { cropMode = true }, enabled = !busy,
+                            text = { Text("裁切邊緣") })
+                    }
+                }
+                Column(
+                    modifier = (if (compact) Modifier else Modifier.weight(1f).verticalScroll(rememberScrollState()))
+                        .padding(top = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (!seam.skipped && cropMode) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            CompactChoice("第 ${seamIndex + 1} 張圖片", selectedImage == seamIndex,
+                                { selectedImage = seamIndex }, Modifier.weight(1f), !busy)
+                            CompactChoice("第 ${seamIndex + 2} 張圖片", selectedImage == seamIndex + 1,
+                                { selectedImage = seamIndex + 1 }, Modifier.weight(1f), !busy)
+                        }
+                        ManualCropSlider(crop, plan.height, !busy, updateCrop)
+                        TextButton(
+                            onClick = { plan = plan.resetImage(selectedImage) },
+                            enabled = !busy,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("還原這張的裁切與對齊", textAlign = TextAlign.Center)
+                        }
+                    } else if (!seam.skipped) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            CompactChoice("重疊對照", previewMode == ManualPreviewMode.Overlap,
+                                { previewMode = ManualPreviewMode.Overlap }, Modifier.weight(1f), !busy)
+                            CompactChoice("拼接結果", previewMode == ManualPreviewMode.Composite,
+                                { previewMode = ManualPreviewMode.Composite }, Modifier.weight(1f), !busy)
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text("微調第 ${seamIndex + 2} 張圖片", color = Ink, modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.bodyMedium)
+                            Row(
+                                modifier = Modifier.heightIn(min = 48.dp).toggleable(
+                                    value = showGuides,
+                                    enabled = !busy,
+                                    role = Role.Switch,
+                                    onValueChange = { showGuides = it },
+                                ),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text("輔助線", color = if (busy) Quiet else Ink,
+                                    style = MaterialTheme.typography.labelMedium)
+                                Switch(checked = showGuides, onCheckedChange = null, enabled = !busy)
+                            }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            listOf(-10 to "↑ 10 px", -1 to "↑ 1 px", 1 to "↓ 1 px", 10 to "↓ 10 px")
+                                .forEach { (delta, label) ->
+                                    OutlinedButton(
+                                        onClick = { plan = plan.withShift(seamIndex, delta) }, enabled = !busy,
+                                        modifier = Modifier.weight(1f).height(48.dp).semantics {
+                                            contentDescription = "第 ${seamIndex + 2} 張圖片${if (delta < 0) "上移" else "下移"} ${abs(delta)} 像素"
+                                        },
+                                        shape = RoundedCornerShape(12.dp),
+                                        contentPadding = PaddingValues(horizontal = 2.dp),
+                                    ) { Text(label, fontSize = 12.sp) }
+                                }
+                        }
+                        if (showGuides) {
+                            Text("綠線：第 ${seamIndex + 1} 張邊界 · 主題色：第 ${seamIndex + 2} 張邊界\n白線：重疊範圍", color = Quiet,
+                                style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+
                 }
             }
-            TextButton(
-                onClick = onCancel,
-                enabled = !busy,
-                modifier = Modifier.fillMaxWidth().height(48.dp),
-            ) { Text("銷毀、不保存", color = MaterialTheme.colorScheme.primary) }
+            Column(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp)) {
+                Text(
+                    seamError ?: when {
+                        cropMode -> "裁切後，回到對齊位置檢查接合處。"
+                        remaining == 0 -> "所有接縫已確認，可以查看成品。"
+                        else -> "還有 $remaining 處待確認 · 對齊後按下方按鈕"
+                    },
+                    color = if (seamError != null) MaterialTheme.colorScheme.primary else Quiet,
+                    style = MaterialTheme.typography.labelMedium,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                )
+                Button(
+                    onClick = {
+                        if (cropMode) {
+                            cropMode = false
+                            previewMode = ManualPreviewMode.Overlap
+                        } else {
+                            val confirmed = if (seam.skipped || seam.confirmed) plan else plan.confirm(seamIndex)
+                            plan = confirmed
+                            if (confirmed.isReady()) onApply(confirmed)
+                            else nextManualSeamToReview(confirmed, seamIndex)?.let(selectSeam)
+                        }
+                    },
+                    enabled = !busy && (cropMode || seamError == null),
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                ) {
+                    if (busy) CircularProgressIndicator(Modifier.size(22.dp), color = Paper, strokeWidth = 2.dp)
+                    else Text(
+                        when {
+                            cropMode -> "完成裁切，返回對齊"
+                            plan.isReady() -> "預覽成品"
+                            seam.skipped || seam.confirmed -> "繼續處理下一處"
+                            otherPending != null -> "確認並繼續"
+                            else -> "確認並預覽成品"
+                        },
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
         }
+        SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).padding(horizontal = 16.dp, vertical = 96.dp))
+    }
+    if (showResetDialog) {
+        AlertDialog(
+            onDismissRequest = { showResetDialog = false },
+            title = { Text("重置位置與裁切？") },
+            text = { Text("目前的手動調整將還原為自動建議。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        plan = plan.resetSeam(seamIndex)
+                        if (plan.seams[seamIndex].skipped) cropMode = false
+                        showResetDialog = false
+                    },
+                    enabled = !busy,
+                ) { Text("重置") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showResetDialog = false }) { Text("取消") }
+            },
+        )
+    }
+    if (showDetails) {
+        AlertDialog(
+            onDismissRequest = { showDetails = false },
+            title = { Text("拼接說明") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("第 ${seamIndex + 1} 張圖片固定，移動第 ${seamIndex + 2} 張圖片，讓相同內容重合。切換「拼接結果」檢查是否有重複或缺漏，再確認接縫。")
+                    Text("位移 ${seam.shift} px · 重疊 ${ManualStitcher.overlap(plan, seamIndex)} px")
+                    if (message != null) Text(message)
+                }
+            },
+            confirmButton = { TextButton(onClick = { showDetails = false }) { Text("知道了") } },
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ManualCropSlider(crop: ManualCrop, height: Int, enabled: Boolean, onChange: (ManualCrop) -> Unit) {
+    val colors = SliderDefaults.colors(inactiveTrackColor = MaterialTheme.colorScheme.outline)
+    val thumb: @Composable (String, Int) -> Unit = { label, removed ->
+        Surface(
+            modifier = Modifier.size(16.dp).semantics {
+                contentDescription = label
+                stateDescription = "裁掉 $removed 像素"
+            },
+            shape = CircleShape,
+            color = if (enabled) colors.thumbColor else colors.disabledThumbColor,
+        ) {}
+    }
+    Column {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("頂部裁掉 ${crop.top} px", Modifier.weight(1f), color = Quiet,
+                style = MaterialTheme.typography.labelMedium)
+            Text("底部裁掉 ${height - crop.bottom} px", Modifier.weight(1f), color = Quiet,
+                style = MaterialTheme.typography.labelMedium, textAlign = TextAlign.End)
+        }
+        RangeSlider(
+            value = crop.top.toFloat()..crop.bottom.toFloat(),
+            onValueChange = { onChange(adjustedManualCrop(crop, it, height)) },
+            valueRange = 0f..height.toFloat(), enabled = enabled,
+            modifier = Modifier.fillMaxWidth(),
+            colors = colors,
+            startThumb = { thumb("頂部裁切邊界", crop.top) },
+            endThumb = { thumb("底部裁切邊界", height - crop.bottom) },
+            track = { state ->
+                SliderDefaults.Track(
+                    rangeSliderState = state,
+                    modifier = Modifier.height(4.dp),
+                    enabled = enabled,
+                    colors = colors,
+                    drawStopIndicator = null,
+                    thumbTrackGapSize = 0.dp,
+                )
+            },
+        )
+    }
+}
+
+internal fun adjustedManualCrop(
+    crop: ManualCrop,
+    range: ClosedFloatingPointRange<Float>,
+    height: Int,
+): ManualCrop {
+    val top = range.start.roundToInt().coerceIn(0, height - 1)
+    val bottom = range.endInclusive.roundToInt().coerceIn(1, height)
+    return when {
+        top < bottom -> ManualCrop(top, bottom)
+        top != crop.top -> crop.copy(top = crop.bottom - 1)
+        else -> crop.copy(bottom = crop.top + 1)
     }
 }
 
@@ -1496,6 +1652,7 @@ private fun CompactChoice(
     selected: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
 ) {
     val content: @Composable () -> Unit = {
         Text(label, fontSize = 12.sp, maxLines = 1)
@@ -1503,7 +1660,8 @@ private fun CompactChoice(
     if (selected) {
         Button(
             onClick = onClick,
-            modifier = modifier.height(40.dp),
+            enabled = enabled,
+            modifier = modifier.height(48.dp).semantics { stateDescription = if (selected) "已選取" else "未選取" },
             shape = RoundedCornerShape(8.dp),
             contentPadding = PaddingValues(horizontal = 8.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Ink),
@@ -1512,7 +1670,8 @@ private fun CompactChoice(
     } else {
         OutlinedButton(
             onClick = onClick,
-            modifier = modifier.height(40.dp),
+            enabled = enabled,
+            modifier = modifier.height(48.dp).semantics { stateDescription = if (selected) "已選取" else "未選取" },
             shape = RoundedCornerShape(8.dp),
             contentPadding = PaddingValues(horizontal = 8.dp),
             content = { content() },
@@ -1529,6 +1688,9 @@ private fun ManualSeamCanvas(
     mode: ManualPreviewMode,
     showGuides: Boolean,
     onDrag: (Float) -> Unit,
+    viewportTop: Float?,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
 ) {
     var canvasSize by remember(plan.width) { mutableStateOf(IntSize.Zero) }
     val accentColor = MaterialTheme.colorScheme.primary
@@ -1540,11 +1702,13 @@ private fun ManualSeamCanvas(
     val currentRowsPerPixel by rememberUpdatedState(rowsPerPixel)
 
     Canvas(
-        Modifier
-            .fillMaxWidth()
-            .height(320.dp)
+        modifier
+            .semantics {
+                contentDescription = if (enabled) "上下拖曳以對齊第 ${seamIndex + 2} 張圖片" else "接縫拼接結果預覽"
+            }
             .onSizeChanged { canvasSize = it }
-            .pointerInput(Unit) {
+            .pointerInput(enabled, seamIndex) {
+                if (!enabled) return@pointerInput
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     down.consume()
@@ -1567,7 +1731,7 @@ private fun ManualSeamCanvas(
             },
     ) {
         drawRect(Color(0xFF20231E))
-        val scale = previewScale
+        val scale = manualPreviewScale(plan, size.width.roundToInt())
         val shift = plan.seams[seamIndex].shift
         val previousCrop = plan.crops[seamIndex]
         val nextCrop = plan.crops[seamIndex + 1]
@@ -1575,10 +1739,7 @@ private fun ManualSeamCanvas(
         val nextBottom = shift.toLong() + nextCrop.bottom
         val overlapStart = maxOf(previousCrop.top.toLong(), nextTop)
         val overlapEnd = minOf(previousCrop.bottom.toLong(), nextBottom)
-        val viewportRows = (size.height / scale).roundToInt().coerceIn(1, plan.height)
-        val center = previousCrop.bottom.toFloat().coerceIn(0f, plan.height.toFloat())
-        val viewTop = (center - viewportRows / 2f)
-            .coerceIn(0f, (plan.height - viewportRows).coerceAtLeast(0).toFloat())
+        val viewTop = viewportTop ?: manualSeamViewTop(plan.height, previousCrop.bottom, size.height / scale)
 
         when (mode) {
             ManualPreviewMode.Overlap -> {
@@ -1647,6 +1808,20 @@ private fun ManualSeamCanvas(
         }
     }
 }
+
+internal fun manualSeamViewTop(imageHeight: Int, cropBottom: Int, visibleRows: Float): Float {
+    val viewportRows = visibleRows.roundToInt().coerceIn(1, imageHeight)
+    val center = cropBottom.toFloat().coerceIn(0f, imageHeight.toFloat())
+    return (center - viewportRows / 2f)
+        .coerceIn(0f, (imageHeight - viewportRows).toFloat())
+}
+
+// Translate between the shared seam coordinates and the selected image's padded scroll content.
+internal fun manualCropScroll(viewTop: Float, imageTop: Int, scale: Float, paddingPx: Int): Int =
+    ((viewTop - imageTop) * scale + paddingPx).roundToInt().coerceAtLeast(0)
+
+internal fun manualCropViewTop(scroll: Int, imageTop: Int, scale: Float, paddingPx: Int): Float =
+    imageTop + (scroll - paddingPx) / scale
 
 private fun manualPreviewScale(
     plan: ManualStitchPlan,

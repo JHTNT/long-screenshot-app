@@ -2,6 +2,7 @@ package app.longscreenshot.capture
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.file.Files
@@ -67,6 +68,71 @@ class ManualStitcherTest {
     }
 
     @Test
+    fun resetSeamRestoresBothCropsAndOnlyCurrentShift() {
+        val initial = plan(proposal(60), proposal(50), proposal(50), proposal(50))
+        val edited = initial.withCrop(0, ManualCrop(3, 95))
+            .withCrop(1, ManualCrop(5, 80))
+            .withCrop(2, ManualCrop(15, 90))
+            .withCrop(3, ManualCrop(7, 95))
+            .withShift(0, -4).withShift(1, 5).withShift(2, -7).withShift(3, -3)
+        val confirmed = edited.seams.indices.fold(edited) { current, index -> current.confirm(index) }
+
+        val reset = confirmed.resetSeam(1)
+
+        assertEquals(initial.defaultCrops[1], reset.crops[1])
+        assertEquals(initial.defaultCrops[2], reset.crops[2])
+        assertEquals(initial.defaultSeams[1], reset.seams[1])
+        for (index in listOf(0, 3, 4)) assertEquals(confirmed.crops[index], reset.crops[index])
+        for (index in listOf(0, 2, 3)) assertEquals(confirmed.seams[index].shift, reset.seams[index].shift)
+        assertFalse(reset.seams[0].confirmed)
+        assertFalse(reset.seams[2].confirmed)
+        assertEquals(confirmed.seams[3], reset.seams[3])
+    }
+
+    @Test
+    fun resettingOnlyShiftPreservesOtherSeamConfirmations() {
+        val edited = plan(proposal(60), proposal(50), proposal(50))
+            .withShift(0, -4).confirm(0)
+            .withShift(1, 5).confirm(1)
+
+        val reset = edited.resetSeam(1)
+
+        assertEquals(edited.defaultSeams[1], reset.seams[1])
+        assertEquals(edited.seams[0], reset.seams[0])
+        assertEquals(edited.seams[2], reset.seams[2])
+    }
+
+    @Test
+    fun resetFirstAndLastSeamsRestoresLowConfidenceDefaults() {
+        val initial = plan(proposal(60, confident = false), proposal(50), proposal(50, confident = false))
+        for (index in listOf(0, initial.seams.lastIndex)) {
+            val edited = initial.withShift(index, -5)
+                .withCrop(index, ManualCrop(10, 90))
+                .withCrop(index + 1, ManualCrop(10, 95))
+                .confirm(index)
+
+            val reset = edited.resetSeam(index)
+
+            assertEquals(initial.defaultCrops[index], reset.crops[index])
+            assertEquals(initial.defaultCrops[index + 1], reset.crops[index + 1])
+            assertEquals(initial.defaultSeams[index], reset.seams[index])
+            assertFalse(reset.seams[index].confirmed)
+        }
+    }
+
+    @Test
+    fun resettingKeptDuplicateRestoresSkipAndInvalidatesFollowingReview() {
+        val initial = plan(proposal(0, reason = StitchReason.Duplicate), proposal(50))
+        val edited = initial.keepDuplicate(0).withShift(1, -5).confirm(0).confirm(1)
+
+        val reset = edited.resetSeam(0)
+
+        assertEquals(initial.defaultSeams[0], reset.seams[0])
+        assertEquals(edited.seams[1].shift, reset.seams[1].shift)
+        assertFalse(reset.seams[1].confirmed)
+    }
+
+    @Test
     fun lowConfidenceSeamMustBeConfirmedBeforeApply() {
         val low = plan(proposal(60, confident = false))
 
@@ -90,6 +156,59 @@ class ManualStitcherTest {
         assertEquals(50, kept.seams[0].shift)
         assertFalse(kept.isReady())
         assertFalse(kept.confirm(0).isReady())
+    }
+
+    @Test
+    fun nextReviewSkipsConfirmedAndDuplicateSeams() {
+        val plan = plan(
+            proposal(60, confident = false),
+            proposal(50),
+            proposal(0, confident = false, reason = StitchReason.Duplicate),
+            proposal(50, confident = false),
+        )
+
+        assertEquals(3, nextManualSeamToReview(plan, 0))
+    }
+
+    @Test
+    fun nextReviewWrapsToEarlierSeamInvalidatedByCrop() {
+        val adjusted = plan(proposal(60), proposal(50))
+            .withCrop(1, ManualCrop(20, 90))
+            .confirm(1)
+
+        assertFalse(adjusted.seams[0].confirmed)
+        assertEquals(0, nextManualSeamToReview(adjusted, 1))
+    }
+
+    @Test
+    fun nextReviewReturnsNullWhenAllSeamsAreComplete() {
+        val complete = plan(
+            proposal(60),
+            proposal(0, confident = false, reason = StitchReason.Duplicate),
+            proposal(50),
+        )
+
+        assertTrue(complete.isReady())
+        assertNull(nextManualSeamToReview(complete, 0))
+    }
+
+    @Test
+    fun nextReviewIncludesConfirmedSeamWithInvalidGeometry() {
+        val initial = plan(proposal(60), proposal(50))
+        val invalid = initial.copy(
+            crops = initial.crops.toMutableList().apply { this[2] = ManualCrop(0, 10) },
+        )
+
+        assertTrue(invalid.seams[1].confirmed)
+        assertEquals("接縫沒有新增內容", ManualStitcher.validate(invalid).seamErrors[1])
+        assertEquals(1, nextManualSeamToReview(invalid, 0))
+    }
+
+    @Test
+    fun nextReviewExcludesCurrentUnconfirmedSeam() {
+        val currentOnly = plan(proposal(60, confident = false))
+
+        assertNull(nextManualSeamToReview(currentOnly, 0))
     }
 
     @Test
