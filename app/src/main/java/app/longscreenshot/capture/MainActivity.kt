@@ -1629,16 +1629,6 @@ private fun ManualSeamCanvas(
                 }
             }
         }
-        if (overlapEnd > overlapStart) {
-            drawRect(
-                Color.White.copy(alpha = 0.08f),
-                topLeft = Offset(0f, (overlapStart - viewTop) * scale),
-                size = Size(
-                    size.width,
-                    ((overlapEnd - overlapStart) * scale).coerceAtLeast(1f),
-                ),
-            )
-        }
         if (showGuides) {
             fun drawGuide(row: Long, color: Color, width: Float = 1.dp.toPx()) {
                 val y = (row - viewTop) * scale
