@@ -232,7 +232,7 @@ class MainActivity : ComponentActivity() {
                     onSave = { format, crop -> runOutput("已存到相簿", format) {
                         CaptureOutput.saveToGallery(this, currentOutput(), format, crop)
                     } },
-                    onCopy = { format, crop -> runOutput("已複製到剪貼簿", format, destroySource = false) {
+                    onCopy = { format, crop -> runOutput("已複製到剪貼簿", format) {
                         CaptureOutput.copyToClipboard(this, currentOutput(), format, crop)
                     } },
                 )
@@ -486,7 +486,6 @@ class MainActivity : ComponentActivity() {
     private fun runOutput(
         successMessage: String,
         format: OutputFormat,
-        destroySource: Boolean = true,
         operation: (OutputFormat) -> Unit,
     ) {
         if (outputBusy) return
@@ -498,12 +497,8 @@ class MainActivity : ComponentActivity() {
                 outputBusy = false
                 if (error != null) {
                     outputMessage = "輸出失敗，來源圖片仍保留，請重試。"
-                } else if (!destroySource) {
-                    outputMessage = successMessage
-                } else if (CaptureSession.destroy()) {
-                    homeMessage = successMessage
                 } else {
-                    outputMessage = "$successMessage，但暫存清除失敗。"
+                    outputMessage = successMessage
                 }
             }
         }, "capture-output").start()
