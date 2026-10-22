@@ -76,13 +76,13 @@ internal object StitchMatcher {
         }
 
         val forward = search(a, b, top, bottom)
-        val reverse = search(b, a, top, bottom)
+        val reverse = if (forward.best.score + MIN_GAP < 1.0) search(b, a, top, bottom) else null
         val zoneSpread = forward.zoneBest.maxOrNull()!! - forward.zoneBest.minOrNull()!!
         val exact = region != null && forward.best.score >= EXACT_SCORE && forward.gap >= EXACT_GAP
         val seamBottom = stableSeamBottom(a, b, forward.best.shift, top, bottom)
         val reason = when {
             forward.best.texture < MIN_TEXTURE -> StitchReason.LowTexture
-            reverse.best.score >= MIN_SCORE && reverse.best.score > forward.best.score + MIN_GAP ->
+            reverse != null && reverse.best.score >= MIN_SCORE && reverse.best.score > forward.best.score + MIN_GAP ->
                 StitchReason.ReverseScroll
             forward.best.score < MIN_SCORE -> StitchReason.NoOverlap
             forward.gap < MIN_GAP && !exact -> StitchReason.Ambiguous
@@ -108,6 +108,8 @@ internal object StitchMatcher {
         val score: Double,
         val texture: Double,
         val zoneScores: DoubleArray,
+        val untrimmedTexture: Double = texture,
+        val untrimmedScore: Double = score,
     )
 
     private data class Search(
@@ -126,17 +128,20 @@ internal object StitchMatcher {
         val maximum = max(minimum, contentHeight - minimumOverlap)
         val step = max(1, contentHeight / 200)
         val coarse = (minimum..maximum step step).map { score(a, b, it, top, bottom) }
-        val seeds = coarse
-            .filter { it.texture >= MIN_TEXTURE }
-            .ifEmpty { coarse }
-            .sortedByDescending { it.score }
-            .take(5)
+        val rankedCoarse = coarse.sortedByDescending { it.score }
+        // Misaligned text can be discarded with dynamic rows; keep it eligible for refinement.
+        val seeds = (
+            rankedCoarse.filter { it.texture >= MIN_TEXTURE }.take(5) +
+                rankedCoarse.filter { it.untrimmedTexture >= MIN_TEXTURE }
+                    .sortedByDescending { it.untrimmedScore }.take(5)
+            ).ifEmpty { rankedCoarse.take(5) }.distinctBy { it.shift }
+        val coarseByShift = coarse.associateBy { it.shift }
         val fine = seeds
             .flatMap { seed ->
-                (max(minimum, seed.shift - step)..minOf(maximum, seed.shift + step))
-                    .map { score(a, b, it, top, bottom) }
+                max(minimum, seed.shift - step)..minOf(maximum, seed.shift + step)
             }
-            .distinctBy { it.shift }
+            .distinct()
+            .map { coarseByShift[it] ?: score(a, b, it, top, bottom) }
         val candidates = coarse + fine
         val ranked = candidates.filter { it.texture >= MIN_TEXTURE }.ifEmpty { candidates }
         val best = ranked.maxBy { it.score }
@@ -195,6 +200,8 @@ internal object StitchMatcher {
             zones.average(),
             kept.count { it.second >= 0.05 }.toDouble() / kept.size,
             zones,
+            rows.count { it.second >= 0.05 }.toDouble() / rows.size,
+            rows.sumOf { it.first.average() } / rows.size,
         )
     }
 
@@ -274,29 +281,15 @@ internal object AutoStitcher {
         }
 
         val seams = ArrayList<StitchProposal>(sources.size - 1)
-        var previous = decode(sources.first())
+        var previous = decodeLuma(sources.first())
         val width = previous.width
         val height = previous.height
         require(region == null || region.bottom <= height) { "指定區域超出圖片" }
-        try {
-            for (source in sources.drop(1)) {
-                val next = decode(source)
-                try {
-                    require(next.width == width && next.height == height) { "圖片尺寸不一致" }
-                    seams += StitchMatcher.find(
-                        previous.toLuma(),
-                        next.toLuma(),
-                        topInset,
-                        bottomInset,
-                        region,
-                    )
-                } finally {
-                    previous.recycle()
-                    previous = next
-                }
-            }
-        } finally {
-            previous.recycle()
+        for (source in sources.drop(1)) {
+            val next = decodeLuma(source)
+            require(next.width == width && next.height == height) { "圖片尺寸不一致" }
+            seams += StitchMatcher.find(previous, next, topInset, bottomInset, region)
+            previous = next
         }
 
         val manualPlan = ManualStitcher.initialPlan(width, height, seams)
@@ -319,8 +312,14 @@ internal object AutoStitcher {
         return Result(target, seams, message, manualPlan)
     }
 
-    private fun decode(file: File): Bitmap =
-        checkNotNull(BitmapFactory.decodeFile(file.path)) { "無法讀取來源圖片" }
+    private fun decodeLuma(file: File): LumaImage {
+        val bitmap = checkNotNull(BitmapFactory.decodeFile(file.path)) { "無法讀取來源圖片" }
+        return try {
+            bitmap.toLuma()
+        } finally {
+            bitmap.recycle()
+        }
+    }
 
     private fun Bitmap.toLuma(): LumaImage {
         val row = IntArray(width)

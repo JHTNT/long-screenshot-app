@@ -6,6 +6,77 @@ import org.junit.Test
 
 class StitchMatcherTest {
     @Test
+    fun refinesSparseOverlapEvenWhenCoarseAlignmentDiscardsTexturedRows() {
+        val width = 180
+        val height = 1972
+        val shift = 1751
+        fun pixels(offset: Int) = ByteArray(width * height) { index ->
+            val x = index % width
+            val y = index / width + offset
+            if (y % 100 < 35) (30 + (x * 13 + (y / 100) * 37) % 150 + y % 35).toByte()
+            else 16
+        }
+
+        val seam = StitchMatcher.find(
+            LumaImage(width, height, pixels(0)),
+            LumaImage(width, height, pixels(shift)),
+            region = VerticalRegion(0, height),
+        )
+
+        assertEquals(shift, seam.shift)
+        assertTrue(seam.toString(), seam.confident)
+    }
+
+    @Test
+    fun rejectsBlankAndRepeatedContent() {
+        val width = 40
+        val height = 200
+        for (repeated in listOf(false, true)) {
+            fun pixels(offset: Int) = ByteArray(width * height) { index ->
+                val x = index % width
+                val y = (index / width + offset) % 40
+                if (repeated) ((x * 37 + y * 19 + x * y % 71) and 0xff).toByte() else 16
+            }
+            val seam = StitchMatcher.find(
+                LumaImage(width, height, pixels(0)),
+                LumaImage(width, height, pixels(15)),
+                region = VerticalRegion(0, height),
+            )
+            assertTrue(seam.toString(), !seam.confident)
+        }
+    }
+
+    @Test
+    fun rejectsUnrelatedImagesAndOverlapBelowMinimum() {
+        val width = 40
+        val height = 200
+        val random = java.util.Random(42)
+        val pixels = ByteArray(width * height * 2).also(random::nextBytes)
+        val first = LumaImage(width, height, pixels.copyOfRange(0, width * height))
+        for (shift in listOf(195, 200)) {
+            val second = LumaImage(width, height, pixels.copyOfRange(width * shift, width * (shift + height)))
+            val seam = StitchMatcher.find(first, second, region = VerticalRegion(0, height))
+            assertTrue(seam.toString(), !seam.confident)
+        }
+    }
+
+    @Test
+    fun stillRecognizesReverseScrollingAndDuplicates() {
+        val width = 40
+        val height = 200
+        val random = java.util.Random(42)
+        val pixels = ByteArray(width * 260).also(random::nextBytes)
+        val first = LumaImage(width, height, pixels.copyOfRange(0, width * height))
+        val second = LumaImage(width, height, pixels.copyOfRange(width * 60, pixels.size))
+        val region = VerticalRegion(0, height)
+
+        val reverse = StitchMatcher.find(second, first, region = region)
+        assertEquals(StitchReason.ReverseScroll, reverse.reason)
+        assertTrue(!reverse.confident)
+        assertEquals(StitchReason.Duplicate, StitchMatcher.find(first, first, region = region).reason)
+    }
+
+    @Test
     fun findsShiftWithSixPercentOverlap() {
         val width = 40
         val height = 200
