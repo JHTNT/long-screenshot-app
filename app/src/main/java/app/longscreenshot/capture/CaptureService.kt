@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
@@ -25,6 +26,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -40,12 +42,18 @@ class CaptureService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val captureThread = HandlerThread("long-screenshot-capture")
     private lateinit var captureHandler: Handler
+    private lateinit var guideFrames: GuideFrameScheduler
     private lateinit var windowManager: WindowManager
 
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
     private var overlay: View? = null
+    private var guide: CaptureGuideView? = null
+    @Volatile private var guideTracker: CaptureGuideTracker? = null
+    @Volatile private var guideGeneration = 0
+    @Volatile private var trackingEnabled = false
+    @Volatile private var captureReady = false
     private var captureWidth = 0
     private var captureHeight = 0
     private var densityDpi = 0
@@ -61,6 +69,14 @@ class CaptureService : Service() {
         super.onCreate()
         captureThread.start()
         captureHandler = Handler(captureThread.looper)
+        guideFrames = GuideFrameScheduler(
+            now = SystemClock::uptimeMillis,
+            post = { task, delay -> captureHandler.postDelayed(task, delay) },
+            remove = { captureHandler.removeCallbacks(it) },
+            consume = {
+                if (trackingEnabled && !captureRequested && !captureBusy) imageReader?.let(::consumeImage)
+            },
+        )
         windowManager = getSystemService(WindowManager::class.java)
         createNotificationChannel()
     }
@@ -71,6 +87,9 @@ class CaptureService : Service() {
             ACTION_FINISH -> finishCapture()
             ACTION_CANCEL -> cancelCapture()
             ACTION_DELETE -> deleteCapture(intent.getIntExtra(EXTRA_INDEX, 0))
+            ACTION_SELECT_REGION -> selectGuideRegion()
+            ACTION_RESUME -> resumeCapture()
+            ACTION_UPDATE_VISIBILITY -> updateOverlayVisibility()
         }
         return START_NOT_STICKY
     }
@@ -133,6 +152,11 @@ class CaptureService : Service() {
 
     private fun capture() {
         if (captureRequested || captureBusy || stopping) return
+        if (count > 0 && (CaptureSession.contentRegion == null ||
+                (CaptureSession.status as? CaptureStatus.SelectingRegion)?.forCapture == true)) {
+            selectGuideRegion()
+            return
+        }
         if (!capturedContentVisible) {
             updateState("回到你分享的 App 再截圖。")
             return
@@ -145,13 +169,20 @@ class CaptureService : Service() {
             }
         }
 
+        captureReady = false
         captureRequested = true
+        virtualDisplay?.setSurface(null)
         captureToken += 1
         val token = captureToken
-        overlay?.visibility = View.INVISIBLE
+        guideGeneration += 1
+        updateOverlayVisibility()
         captureHandler.postDelayed({
             if (captureRequested && captureToken == token) {
-                imageReader?.let { virtualDisplay?.setSurface(it.surface) }
+                imageReader?.let {
+                    it.acquireLatestImage()?.close()
+                    captureReady = true
+                    virtualDisplay?.setSurface(it.surface)
+                }
             }
         }, 50)
         mainHandler.postDelayed({
@@ -160,35 +191,52 @@ class CaptureService : Service() {
     }
 
     private fun handleImage(reader: ImageReader) {
+        if (reader !== imageReader) return
+        if (!captureRequested && !captureBusy) {
+            guideFrames.onFrame()
+        } else {
+            consumeImage(reader)
+        }
+    }
+
+    private fun consumeImage(reader: ImageReader) {
         val image = reader.acquireLatestImage() ?: return
-        if (!captureRequested) {
-            image.close()
+        if (!captureRequested || !captureReady) {
+            try {
+                if (!captureRequested && trackingEnabled) trackGuide(image)
+            } finally {
+                image.close()
+            }
             return
         }
+        captureReady = false
         captureRequested = false
         captureBusy = true
         virtualDisplay?.setSurface(null)
-        mainHandler.post { overlay?.visibility = View.VISIBLE }
-        try {
-            saveImage(image)
-            count += 1
-            mainHandler.post {
-                updateBadge()
-                updateState(
-                    if (count == 1) "向下捲動並保留一部分重疊內容，再按一次截圖。" else null,
-                )
-                getSystemService(NotificationManager::class.java)
-                    .notify(NOTIFICATION_ID, notification(count))
-            }
-        } catch (error: Throwable) {
-            mainHandler.post {
-                failCapture(
-                    if (error.message == "畫面受保護或為空白") error.message!! else "截圖保存失敗，請再試一次。",
-                )
-            }
+        val result = try {
+            runCatching { saveImage(image) }
         } finally {
-            captureBusy = false
             image.close()
+        }
+        mainHandler.post {
+            captureBusy = false
+            if (stopping) return@post
+            result.fold(
+                onSuccess = {
+                    count += 1
+                    updateBadge()
+                    updateState(null)
+                    if (CaptureSession.contentRegion == null) selectGuideRegion() else refreshGuide()
+                    updateOverlayVisibility()
+                    getSystemService(NotificationManager::class.java)
+                        .notify(NOTIFICATION_ID, notification(count))
+                },
+                onFailure = { error ->
+                    failCapture(
+                        if (error.message == "畫面受保護或為空白") error.message!! else "截圖保存失敗，請再試一次。",
+                    )
+                },
+            )
         }
     }
 
@@ -223,10 +271,12 @@ class CaptureService : Service() {
     }
 
     private fun failCapture(message: String) {
+        captureReady = false
         captureRequested = false
         virtualDisplay?.setSurface(null)
-        overlay?.visibility = View.VISIBLE
         updateState(message)
+        if (guideTracker == null) refreshGuide()
+        updateOverlayVisibility()
     }
 
     private fun updateState(message: String?) {
@@ -240,8 +290,10 @@ class CaptureService : Service() {
             return
         }
         count -= 1
+        if (count == 0) CaptureSession.contentRegion = null
         updateBadge()
         updateState(if (count == 0) "目前沒有已擷取的圖片。" else null)
+        refreshGuide()
         getSystemService(NotificationManager::class.java)
             .notify(NOTIFICATION_ID, notification(count))
     }
@@ -358,6 +410,7 @@ class CaptureService : Service() {
 
         override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
             capturedContentVisible = isVisible
+            updateOverlayVisibility()
         }
     }
 
@@ -365,6 +418,7 @@ class CaptureService : Service() {
         captureRequested = false
         overlay?.let { runCatching { windowManager.removeView(it) } }
         overlay = null
+        clearGuide()
         virtualDisplay?.release()
         virtualDisplay = null
         imageReader?.close()
@@ -374,6 +428,148 @@ class CaptureService : Service() {
         projection?.apply {
             unregisterCallback(projectionCallback)
             if (stopProjection) stop()
+        }
+    }
+
+    private fun selectGuideRegion() {
+        if (stopping || captureRequested || captureBusy || count == 0) return
+        clearGuide()
+        CaptureSession.status = CaptureStatus.SelectingRegion(count, forCapture = true)
+        updateOverlayVisibility()
+        runCatching {
+            startActivity(Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
+            })
+        }
+        // The notification also opens the selector if the system blocks a background launch.
+    }
+
+    private fun resumeCapture() {
+        if (stopping || count == 0) return
+        updateState(
+            if (CaptureSession.contentRegion == null) "按截圖鈕設定上下固定區域後繼續。"
+            else "上界到虛線是重疊範圍，建議保留 15–25%；無法確認時，請往回捲一些。",
+        )
+        refreshGuide()
+        updateOverlayVisibility()
+    }
+
+    private fun updateOverlayVisibility() {
+        val visible = !stopping && !captureRequested && !captureBusy && !CaptureSession.appVisible
+        overlay?.visibility = if (visible) View.VISIBLE else View.INVISIBLE
+        val state = CaptureOverlayState(
+            visible = visible,
+            capturing = CaptureSession.status is CaptureStatus.Capturing,
+            contentVisible = capturedContentVisible,
+            guideReady = guideTracker != null,
+        )
+        guide?.visibility = if (state.showGuide) View.VISIBLE else View.INVISIBLE
+        trackingEnabled = state.trackingEnabled
+        captureHandler.post { guideFrames.setEnabled(state.trackingEnabled) }
+        if (!captureRequested && !captureBusy) {
+            virtualDisplay?.setSurface(if (state.streamFrames) imageReader?.surface else null)
+        }
+    }
+
+    private fun clearGuide() {
+        guideGeneration += 1
+        trackingEnabled = false
+        captureHandler.post { guideFrames.setEnabled(false) }
+        guideTracker = null
+        guide?.let { runCatching { windowManager.removeView(it) } }
+        guide = null
+        if (!captureRequested && !captureBusy) virtualDisplay?.setSurface(null)
+    }
+
+    private fun refreshGuide() {
+        clearGuide()
+        val region = CaptureSession.contentRegion ?: return
+        if (stopping || count == 0) return
+        val screen = screenBounds()
+        val geometry = captureGuideGeometry(
+            region, captureWidth, captureHeight, screen.width(), screen.height(),
+            CaptureSession.systemTopInset, CaptureSession.systemBottomInset,
+        )
+        if (geometry == null) {
+            updateState("目前擷取視窗無法對齊螢幕，暫不顯示提示線；請保留約 15–25% 的共同內容。")
+            return
+        }
+        val view = CaptureGuideView(this)
+        val params = WindowManager.LayoutParams(
+            captureWidth, geometry.height,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = geometry.screenTop
+            // Window opacity permits touch-through on Android 12+.
+            alpha = 0.65f
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            if (Build.VERSION.SDK_INT >= 30) setFitInsetsTypes(0)
+        }
+        guide = view
+        updateOverlayVisibility()
+        try {
+            windowManager.addView(view, params)
+        } catch (_: Exception) {
+            clearGuide()
+            updateState("提示線無法顯示，截圖仍保留。")
+            return
+        }
+        val source = CaptureSession.sourceFile(count)
+        val generation = guideGeneration
+        val width = captureWidth
+        val height = captureHeight
+        captureHandler.post {
+            val result = runCatching {
+                val bitmap = checkNotNull(BitmapFactory.decodeFile(source.path))
+                try {
+                    check(bitmap.width == width && bitmap.height == height)
+                    val pixels = IntArray(width * region.height)
+                    bitmap.getPixels(pixels, 0, width, 0, region.top, width, region.height)
+                    sampleGuideLuma(width, region) { x, y ->
+                        val color = pixels[(y - region.top) * width + x]
+                        ((color ushr 16 and 0xff) * 77 + (color ushr 8 and 0xff) * 150 +
+                            (color and 0xff) * 29) ushr 8
+                    }
+                } finally {
+                    bitmap.recycle()
+                }
+            }
+            mainHandler.post referenceReady@{
+                if (stopping || generation != guideGeneration) return@referenceReady
+                guideTracker = result.getOrNull()?.let(::CaptureGuideTracker)
+                if (result.isFailure) updateState("上一張位置無法讀取，截圖仍保留；可重新調整範圍。")
+                updateOverlayVisibility()
+            }
+        }
+    }
+
+    private fun trackGuide(image: Image) {
+        val tracker = guideTracker ?: return
+        val region = CaptureSession.contentRegion ?: return
+        val generation = guideGeneration
+        val bottom = runCatching {
+            require(region.bottom <= image.height)
+            val plane = image.planes.first()
+            val buffer = plane.buffer
+            val current = sampleGuideLuma(image.width, region) { x, y ->
+                val offset = y * plane.rowStride + x * plane.pixelStride
+                ((buffer.get(offset).toInt() and 0xff) * 77 +
+                    (buffer.get(offset + 1).toInt() and 0xff) * 150 +
+                    (buffer.get(offset + 2).toInt() and 0xff) * 29) ushr 8
+            }
+            tracker.locate(current)
+        }.getOrNull()
+        mainHandler.post {
+            if (!stopping && trackingEnabled && generation == guideGeneration) {
+                guide?.previousBottom = bottom
+            }
         }
     }
 
@@ -426,6 +622,7 @@ class CaptureService : Service() {
         container.setOnTouchListener(OverlayTouchListener(params))
         windowManager.addView(container, params)
         overlay = container
+        updateOverlayVisibility()
     }
 
     private inner class OverlayTouchListener(
@@ -537,6 +734,9 @@ class CaptureService : Service() {
         const val ACTION_START = "app.longscreenshot.capture.START"
         const val ACTION_FINISH = "app.longscreenshot.capture.FINISH"
         const val ACTION_CANCEL = "app.longscreenshot.capture.CANCEL"
+        const val ACTION_SELECT_REGION = "app.longscreenshot.capture.SELECT_REGION"
+        const val ACTION_RESUME = "app.longscreenshot.capture.RESUME"
+        const val ACTION_UPDATE_VISIBILITY = "app.longscreenshot.capture.UPDATE_VISIBILITY"
         const val ACTION_CONFIRM_CANCEL = "app.longscreenshot.capture.CONFIRM_CANCEL"
         private const val ACTION_DELETE = "app.longscreenshot.capture.DELETE"
         private const val EXTRA_RESULT_DATA = "projection-result-data"
@@ -563,3 +763,10 @@ class CaptureService : Service() {
 
 internal fun resolveSystemInset(windowInset: Int, resourceInset: Int): Int =
     max(windowInset, resourceInset)
+
+internal class CaptureOverlayState(visible: Boolean, capturing: Boolean, contentVisible: Boolean, guideReady: Boolean) {
+    val showGuide = visible && capturing && contentVisible
+    val trackingEnabled = showGuide && guideReady
+    // Visibility callbacks can recover only after the projection output is attached again.
+    val streamFrames = visible && capturing
+}

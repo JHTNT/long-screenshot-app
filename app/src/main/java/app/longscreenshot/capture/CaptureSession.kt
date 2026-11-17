@@ -11,7 +11,7 @@ sealed interface CaptureStatus {
     data object Starting : CaptureStatus
     data class Capturing(val count: Int, val message: String? = null) : CaptureStatus
     data class Reviewing(val count: Int, val message: String? = null) : CaptureStatus
-    data class SelectingRegion(val count: Int) : CaptureStatus
+    data class SelectingRegion(val count: Int, val forCapture: Boolean = false) : CaptureStatus
     data class Stitching(val count: Int) : CaptureStatus
     data class Finished(
         val count: Int,
@@ -40,7 +40,11 @@ object CaptureSession {
     var systemBottomInset = 0
         internal set
 
+    internal var contentRegion: VerticalRegion? = null
+    internal var appVisible = false
+
     fun create(context: Context): File {
+        contentRegion = null
         val root = File(context.cacheDir, "capture-sessions").apply { mkdirs() }
         return File(root, System.currentTimeMillis().toString()).apply {
             check(mkdir()) { "無法建立暫存目錄" }
@@ -77,6 +81,7 @@ object CaptureSession {
         val deleted = target == null || !target.exists() || target.deleteRecursively()
         if (deleted) {
             directory = null
+            contentRegion = null
             systemTopInset = 0
             systemBottomInset = 0
             status = CaptureStatus.Idle

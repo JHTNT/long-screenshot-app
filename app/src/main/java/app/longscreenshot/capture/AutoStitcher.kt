@@ -6,6 +6,8 @@ import java.io.File
 import kotlin.math.abs
 import kotlin.math.max
 
+private const val TRACKING_ROW_BANDS = 4
+
 internal enum class StitchReason(val message: String) {
     Matched("已找到可靠重疊"),
     Duplicate("與前一張重複"),
@@ -37,6 +39,29 @@ internal data class LumaImage(
     }
 
     operator fun get(x: Int, y: Int): Int = pixels[y * width + x].toInt() and 0xff
+
+    internal val trackingGradients by lazy(LazyThreadSafetyMode.NONE) {
+        IntArray(pixels.size) { i ->
+            val value = pixels[i].toInt() and 0xff
+            val left = if (i % width == 0) value else pixels[i - 1].toInt() and 0xff
+            val above = if (i < width) value else pixels[i - width].toInt() and 0xff
+            (abs(value - left) + abs(value - above)).coerceAtMost(255)
+        }
+    }
+
+    internal val trackingRows by lazy(LazyThreadSafetyMode.NONE) {
+        val rowSize = TRACKING_ROW_BANDS * 2
+        IntArray(height * rowSize).also { rows ->
+            for (y in 0 until height) {
+                for (x in 1 until width step 2) {
+                    val band = x * TRACKING_ROW_BANDS / width
+                    val offset = y * rowSize + band * 2
+                    rows[offset] += this[x, y]
+                    rows[offset + 1] += trackingGradients[y * width + x]
+                }
+            }
+        }
+    }
 }
 
 internal data class VerticalRegion(val top: Int, val bottom: Int) {
@@ -54,6 +79,135 @@ internal object StitchMatcher {
     private const val MIN_GAP = 0.01
     private const val EXACT_SCORE = 0.998
     private const val EXACT_GAP = 0.001
+    private const val MIN_TRACKING_SCORE = 0.94
+    private const val MIN_TRACKING_GAP = 0.015
+
+    // Preserve source rows; use row summaries to shortlist shifts before comparing pixels.
+    fun track(a: LumaImage, b: LumaImage, expectedShift: Int? = null): Int? {
+        require(a.width == b.width && a.height == b.height)
+        if (a.trackingGradients.none { it >= 12 } && b.trackingGradients.none { it >= 12 }) return null
+        val scale = max(1, a.height / 160)
+        val minimumOverlap = max(12 * scale, a.height / 20)
+        // Short overlaps must compete, or a weaker long lookalike can win after the true position leaves range.
+        val maximum = a.height - 4 * scale
+        if (maximum < 0) return null
+        val candidates = if (scale == 1) (0..maximum).toList() else {
+            val ar = a.trackingRows
+            val br = b.trackingRows
+            val rowSize = TRACKING_ROW_BANDS * 2
+            val errors = DoubleArray(maximum + 1) { shift ->
+                var error = 0L
+                var samples = 0
+                for (y in 1 until a.height - shift step max(1, (a.height - shift) / 64)) {
+                    for (feature in 0 until rowSize) {
+                        error += abs(ar[(y + shift) * rowSize + feature] - br[y * rowSize + feature])
+                    }
+                    samples++
+                }
+                error.toDouble() / max(1, samples)
+            }
+            val ranked = errors.indices.sortedBy { errors[it] }
+            val seeds = ArrayList<Int>()
+            for (shift in ranked) {
+                if (seeds.none { abs(it - shift) <= 2 * scale }) seeds += shift
+                if (seeds.size == 8) break
+            }
+            // Row sums can tie despite different pixels, including within one horizontal band.
+            val seedErrors = seeds.map { errors[it] }.toSet()
+            val tiedSeeds = ranked.filter { errors[it] in seedErrors }.toMutableList()
+            if (expectedShift != null) tiedSeeds += expectedShift
+            tiedSeeds.flatMap { max(0, it - 2)..minOf(maximum, it + 2) }.distinct()
+        }
+        val scores = DoubleArray(maximum + 1) { -1.0 }
+        var bestShift = 0
+        var bestScore = -1.0
+        var bestTexture = 0.0
+        var expectedBestShift = -1
+        var expectedBestScore = -1.0
+        var expectedTexture = 0.0
+        for (shift in candidates) {
+            val score = trackingScore(a, b, shift, max(MIN_TRACKING_SCORE, bestScore) - MIN_TRACKING_GAP)
+            if (score.texture < MIN_TEXTURE) continue
+            val similarity = score.similarity
+            // Two separated perfect matches cannot become a unique match by examining more candidates.
+            if (expectedShift == null && bestScore == 1.0 && similarity == 1.0 &&
+                abs(shift - bestShift) > 2 * scale) return null
+            scores[shift] = similarity
+            if (similarity > bestScore) {
+                bestScore = similarity
+                bestShift = shift
+                bestTexture = score.texture
+            }
+            if (expectedShift != null && abs(shift - expectedShift) <= 2 * scale && similarity > expectedBestScore) {
+                expectedBestShift = shift
+                expectedBestScore = similarity
+                expectedTexture = score.texture
+            }
+        }
+        // Recent motion can break a tie, but cannot override a better match elsewhere (including short overlaps).
+        if (expectedShift != null) return expectedBestShift.takeIf {
+            it >= 0 && a.height - it >= minimumOverlap && expectedTexture >= MIN_TEXTURE &&
+                expectedBestScore >= MIN_TRACKING_SCORE && expectedBestScore >= bestScore
+        }
+        val second = candidates.filter { abs(it - bestShift) > 2 * scale }
+            .maxOfOrNull { scores[it] } ?: 0.0
+        return bestShift.takeIf {
+            a.height - bestShift >= minimumOverlap && bestTexture >= MIN_TEXTURE &&
+                bestScore >= MIN_TRACKING_SCORE && bestScore - second >= MIN_TRACKING_GAP
+        }
+    }
+
+    // The saved reference supplies this displacement; distant repeated cards cannot veto its verification.
+    fun confirmsRecentMovement(a: LumaImage, b: LumaImage, shift: Int): Boolean {
+        require(a.width == b.width && a.height == b.height)
+        if (shift !in -a.height / 2..a.height / 2) return false
+        val first = if (shift < 0) b else a
+        val second = if (shift < 0) a else b
+        return (max(0, abs(shift) - 2)..minOf(a.height / 2, abs(shift) + 2)).any {
+            val score = trackingScore(first, second, it)
+            score.similarity >= 0.98 && score.texture >= MIN_TEXTURE
+        }
+    }
+
+    private data class TrackingScore(val similarity: Double, val texture: Double)
+
+    private fun trackingScore(a: LumaImage, b: LumaImage, shift: Int, minimumScore: Double = 0.0): TrackingScore {
+        val ags = a.trackingGradients
+        val bgs = b.trackingGradients
+        var error = 0L
+        var samples = 0
+        var texturedRows = 0
+        var rows = 0
+        val end = a.height - shift
+        val step = max(1, end / 160)
+        val totalRows = if (end > 1) (end - 2) / step + 1 else 0
+        for (y in 1 until end step step) {
+            var textured = 0
+            var columns = 0
+            for (x in 1 until a.width step 2) {
+                val av = a[x, y + shift]
+                val bv = b[x, y]
+                val ag = ags[(y + shift) * a.width + x]
+                val bg = bgs[y * b.width + x]
+                val hasDetail = max(ag, bg) >= 12
+                // Repeated blank backgrounds must not drown out differences in text and edges.
+                val weight = if (hasDetail) 4 else 1
+                error += (abs(av - bv) * 35 + abs(ag - bg) * 65) * weight
+                samples += weight
+                if (hasDetail) textured += 1
+                columns += 1
+            }
+            if (columns > 0 && textured.toDouble() / columns >= 0.05) texturedRows += 1
+            rows++
+            // Even perfect remaining pixels at maximum weight cannot rescue this candidate.
+            val maximumSamples = samples + (totalRows - rows) * columns * 4
+            if (error > (1.0 - minimumScore) * 25500.0 * maximumSamples) return TrackingScore(0.0, 0.0)
+        }
+        return TrackingScore(
+            if (samples == 0) 0.0 else 1.0 - error / (25500.0 * samples),
+            if (rows == 0) 0.0 else texturedRows.toDouble() / rows,
+        )
+    }
 
     fun find(
         a: LumaImage,

@@ -9,10 +9,12 @@ class CaptureSessionTest {
     @Test
     fun destroyReturnsToIdleWithoutAnExistingDirectory() {
         CaptureSession.directory = null
+        CaptureSession.contentRegion = VerticalRegion(10, 100)
         CaptureSession.status = CaptureStatus.Failed("測試")
 
         assertTrue(CaptureSession.destroy())
         assertEquals(CaptureStatus.Idle, CaptureSession.status)
+        assertEquals(null, CaptureSession.contentRegion)
     }
 
     @Test

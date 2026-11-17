@@ -137,7 +137,8 @@ private enum class PermissionStep { Overlay, Notification }
 private enum class ManualPreviewMode { Overlap, Composite }
 
 internal fun previousCaptureScreen(status: CaptureStatus): CaptureStatus? = when (status) {
-    is CaptureStatus.SelectingRegion -> CaptureStatus.Reviewing(status.count)
+    is CaptureStatus.SelectingRegion -> if (status.forCapture) CaptureStatus.Capturing(status.count)
+    else CaptureStatus.Reviewing(status.count)
     is CaptureStatus.Stitching -> CaptureStatus.SelectingRegion(status.count)
     is CaptureStatus.Failed -> if (status.retainedCount > 0) {
         CaptureStatus.Reviewing(status.retainedCount)
@@ -221,8 +222,12 @@ class MainActivity : ComponentActivity() {
                     },
                     onPermission = ::requestCurrentPermission,
                     onFinish = { startService(CaptureService.actionIntent(this, CaptureService.ACTION_FINISH)) },
+                    onReturnToCapture = ::navigateBack,
                     onDelete = { startService(CaptureService.deleteIntent(this, it)) },
                     onReviewDelete = ::deleteReviewedSource,
+                    onGuideRegion = {
+                        startService(CaptureService.actionIntent(this, CaptureService.ACTION_SELECT_REGION))
+                    },
                     onRegionConfirm = ::stitchSelectedRegion,
                     onManual = ::openManualEditor,
                     onManualApply = ::applyManualPlan,
@@ -244,8 +249,10 @@ class MainActivity : ComponentActivity() {
                         confirmButton = {
                             TextButton(onClick = {
                                 showCancelDialog = false
-                                when (CaptureSession.status) {
-                                    CaptureStatus.Starting, is CaptureStatus.Capturing ->
+                                val status = CaptureSession.status
+                                when {
+                                    status is CaptureStatus.Starting || status is CaptureStatus.Capturing ||
+                                        status is CaptureStatus.SelectingRegion && status.forCapture ->
                                         startService(CaptureService.actionIntent(this, CaptureService.ACTION_CANCEL))
                                     else -> {
                                         if (CaptureSession.destroy()) {
@@ -263,6 +270,24 @@ class MainActivity : ComponentActivity() {
                     )
                 }
             }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        setCaptureAppVisible(true)
+    }
+
+    override fun onStop() {
+        setCaptureAppVisible(false)
+        super.onStop()
+    }
+
+    private fun setCaptureAppVisible(visible: Boolean) {
+        CaptureSession.appVisible = visible
+        val status = CaptureSession.status
+        if (status is CaptureStatus.Capturing || status is CaptureStatus.SelectingRegion && status.forCapture) {
+            startService(CaptureService.actionIntent(this, CaptureService.ACTION_UPDATE_VISIBILITY))
         }
     }
 
@@ -302,8 +327,13 @@ class MainActivity : ComponentActivity() {
                 returnToPreviousEdit(status.count)
             }
             is CaptureStatus.Finished -> if (!outputBusy) returnToPreviousEdit(status.count)
-            is CaptureStatus.SelectingRegion, is CaptureStatus.Failed ->
+            is CaptureStatus.SelectingRegion -> if (status.forCapture) {
+                startService(CaptureService.actionIntent(this, CaptureService.ACTION_RESUME))
+                moveTaskToBack(true)
+            } else {
                 CaptureSession.status = checkNotNull(previousCaptureScreen(status))
+            }
+            is CaptureStatus.Failed -> CaptureSession.status = checkNotNull(previousCaptureScreen(status))
             CaptureStatus.Idle -> Unit
         }
     }
@@ -365,17 +395,27 @@ class MainActivity : ComponentActivity() {
 
     private fun stitchSelectedRegion(range: ClosedFloatingPointRange<Float>) {
         val selecting = CaptureSession.status as? CaptureStatus.SelectingRegion ?: return
-        val generation = ++stitchGeneration
-        val operationTarget = CaptureSession.resultFile().resolveSibling("result-$generation.png")
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(CaptureSession.sourceFile(1).path, bounds)
         if (bounds.outHeight <= 0) {
-            CaptureSession.status = CaptureStatus.Failed("無法讀取區域選取圖片。", selecting.count)
+            if (selecting.forCapture) {
+                Toast.makeText(this, "無法讀取圖片，請返回檢查截圖。", Toast.LENGTH_SHORT).show()
+            } else {
+                CaptureSession.status = CaptureStatus.Failed("無法讀取區域選取圖片。", selecting.count)
+            }
             return
         }
         val top = (bounds.outHeight * range.start).roundToInt()
         val bottom = (bounds.outHeight * range.endInclusive).roundToInt()
         val region = VerticalRegion(top, bottom)
+        CaptureSession.contentRegion = region
+        if (selecting.forCapture) {
+            startService(CaptureService.actionIntent(this, CaptureService.ACTION_RESUME))
+            moveTaskToBack(true)
+            return
+        }
+        val generation = ++stitchGeneration
+        val operationTarget = CaptureSession.resultFile().resolveSibling("result-$generation.png")
         CaptureSession.status = CaptureStatus.Stitching(selecting.count)
         Thread({
             val result = runCatching {
@@ -518,8 +558,10 @@ private fun App(
     onStart: () -> Unit,
     onPermission: () -> Unit,
     onFinish: () -> Unit,
+    onReturnToCapture: () -> Unit,
     onDelete: (Int) -> Unit,
     onReviewDelete: (Int) -> Unit,
+    onGuideRegion: () -> Unit,
     onRegionConfirm: (ClosedFloatingPointRange<Float>) -> Unit,
     onManual: () -> Unit,
     onManualApply: (ManualStitchPlan) -> Unit,
@@ -539,7 +581,10 @@ private fun App(
                 onStart,
             )
             CaptureStatus.Starting -> CenterStatus("正在準備", "即將顯示懸浮截圖按鈕。")
-            is CaptureStatus.Capturing -> CapturingScreen(target, onFinish, onCancel, onDelete)
+            is CaptureStatus.Capturing -> CapturingScreen(
+                target, onFinish, onCancel, onDelete, onGuideRegion = onGuideRegion,
+                onReturnToCapture = onReturnToCapture,
+            )
             is CaptureStatus.Reviewing -> CapturingScreen(
                 status = CaptureStatus.Capturing(target.count, target.message),
                 onFinish = {
@@ -550,7 +595,9 @@ private fun App(
                 active = false,
             )
             is CaptureStatus.SelectingRegion -> RegionSelectionScreen(
-                source = CaptureSession.sourceFile(1),
+                source = CaptureSession.sourceFile(if (target.forCapture) target.count else 1),
+                forCapture = target.forCapture,
+                initialRegion = CaptureSession.contentRegion,
                 onConfirm = onRegionConfirm,
                 onCancel = onCancel,
             )
@@ -607,7 +654,7 @@ private fun HomeScreen(
                 color = Quiet,
             )
             Spacer(Modifier.height(10.dp))
-            Text("完成擷取後，選擇拼接時要用於判斷的範圍。", color = Quiet)
+            Text("第一張截圖後，框出可捲動內容，排除上下固定區域，再依提示線保留重疊內容。", color = Quiet)
             if (message != null) {
                 Spacer(Modifier.height(14.dp))
                 Text(message, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodyMedium)
@@ -812,6 +859,8 @@ private fun CapturingScreen(
     onCancel: () -> Unit,
     onDelete: (Int) -> Unit,
     active: Boolean = true,
+    onGuideRegion: (() -> Unit)? = null,
+    onReturnToCapture: (() -> Unit)? = null,
 ) {
     var deleteIndex by remember { mutableStateOf<Int?>(null) }
 
@@ -829,6 +878,9 @@ private fun CapturingScreen(
                 style = MaterialTheme.typography.bodyLarge,
                 color = Quiet,
             )
+        }
+        if (active && status.count > 0 && onGuideRegion != null) {
+            TextButton(onClick = onGuideRegion) { Text("調整上下固定區域") }
         }
         Spacer(Modifier.height(20.dp))
         LazyColumn(
@@ -855,13 +907,22 @@ private fun CapturingScreen(
         }
         Spacer(Modifier.height(20.dp))
         Column {
-            Button(
-                onClick = onFinish,
-                enabled = active || status.count > 0,
-                modifier = Modifier.fillMaxWidth().height(52.dp),
-                shape = RoundedCornerShape(10.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Ink),
-            ) { Text("完成") }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (active && onReturnToCapture != null) {
+                    OutlinedButton(
+                        onClick = onReturnToCapture,
+                        modifier = Modifier.weight(1f).height(52.dp),
+                        shape = RoundedCornerShape(10.dp),
+                    ) { Text("返回截圖") }
+                }
+                Button(
+                    onClick = onFinish,
+                    enabled = active || status.count > 0,
+                    modifier = Modifier.weight(1f).height(52.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Ink),
+                ) { Text("完成") }
+            }
             Spacer(Modifier.height(8.dp))
             OutlinedButton(
                 onClick = onCancel,
@@ -925,20 +986,33 @@ private fun CaptureThumbnail(
 @Composable
 private fun RegionSelectionScreen(
     source: java.io.File,
+    forCapture: Boolean,
+    initialRegion: VerticalRegion?,
     onConfirm: (ClosedFloatingPointRange<Float>) -> Unit,
     onCancel: () -> Unit,
 ) {
-    var range by remember(source.path) { mutableStateOf(0.12f..0.78f) }
+    var range by remember(source.path, forCapture) { mutableStateOf(0.12f..0.78f) }
     val loaded by produceState<LoadedPreview?>(null, source.path) {
         value = withContext(Dispatchers.IO) { loadPreview(source) }
+    }
+
+    LaunchedEffect(loaded, initialRegion) {
+        val preview = loaded ?: return@LaunchedEffect
+        initialRegion?.takeIf { it.bottom <= preview.height }?.let {
+            range = it.top.toFloat() / preview.height..it.bottom.toFloat() / preview.height
+        }
     }
 
     Column(
         Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 16.dp, vertical = 8.dp),
     ) {
-        AppHeader("指定區域")
+        AppHeader(if (forCapture) "排除固定區域" else "確認拼接區域")
         Spacer(Modifier.height(8.dp))
-        Text("完整保留第一張與最後一張，中間依選取範圍拼接。", color = Quiet)
+        Text(
+            if (forCapture) "把上方標題列、下方工具列或輸入框留在暗色區域，只框出會捲動的內容。"
+            else "已沿用擷取時的範圍，可調整後拼接。首張頂端與末張底端會保留。",
+            color = Quiet,
+        )
         Spacer(Modifier.height(8.dp))
         Surface(
             modifier = Modifier.fillMaxWidth().weight(1f),
@@ -973,7 +1047,8 @@ private fun RegionSelectionScreen(
         }
         Spacer(Modifier.height(6.dp))
         Text(
-            "拖曳上下邊界線調整",
+            if (forCapture) "上界到虛線是重疊範圍，建議保留 15–25%；無法確認時，請往回捲一些。"
+            else "拖曳上下邊界線調整",
             color = Quiet,
         )
         Row(
@@ -990,7 +1065,7 @@ private fun RegionSelectionScreen(
                 modifier = Modifier.weight(2f).height(48.dp),
                 shape = RoundedCornerShape(10.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Ink),
-            ) { Text("開始拼接") }
+            ) { Text(if (forCapture) "確認並繼續擷取" else "開始拼接") }
         }
     }
 }
