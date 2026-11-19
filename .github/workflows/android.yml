@@ -1,0 +1,80 @@
+name: Android
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Test, lint and build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - run: bash ./gradlew testDebugUnitTest lintDebug assembleDebug
+
+  release:
+    name: Publish signed APK
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !github.event.deleted
+    needs: check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - run: bash ./gradlew assembleRelease
+
+      - name: Check release version
+        run: |
+          version=$(jq -er '.elements[0].versionName' app/build/outputs/apk/release/output-metadata.json)
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "Expected tag v$version for this APK, got $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+      - name: Sign and verify APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          : "${KEYSTORE_BASE64:?Missing ANDROID_KEYSTORE_BASE64}" "${STORE_PASSWORD:?Missing ANDROID_KEYSTORE_PASSWORD}"
+          : "${KEY_ALIAS:?Missing ANDROID_KEY_ALIAS}" "${KEY_PASSWORD:?Missing ANDROID_KEY_PASSWORD}"
+          umask 077
+          keystore="$RUNNER_TEMP/release.keystore"
+          trap 'rm -f "$keystore"' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          signer="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          "$signer" sign --ks "$keystore" --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:STORE_PASSWORD --key-pass env:KEY_PASSWORD \
+            --out LongScreenshot.apk app/build/outputs/apk/release/app-release-unsigned.apk
+          expected_cert=4ec96bb62f1ecb8172af719cbea3ffa63da44ae65a55e25a6334eefc021c7b66
+          certs=$("$signer" verify --print-certs LongScreenshot.apk)
+          if ! grep -Fxq "Signer #1 certificate SHA-256 digest: $expected_cert" <<< "$certs"; then
+            echo "APK signer does not match the Long Screenshot release certificate" >&2
+            exit 1
+          fi
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" LongScreenshot.apk --verify-tag --generate-notes
