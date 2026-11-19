@@ -11,7 +11,10 @@ import android.graphics.Rect
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
+import androidx.annotation.MainThread
 import androidx.core.content.FileProvider
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 
 internal enum class OutputFormat(
@@ -24,6 +27,21 @@ internal enum class OutputFormat(
 
 internal object CaptureOutput {
     private const val SHARE_LIFETIME_MILLIS = 24 * 60 * 60 * 1000L
+
+    @MainThread
+    suspend fun runOutput(action: String, successMessage: String, write: (File) -> Unit) {
+        val preview = CaptureSession.status as? CaptureStatus.Finished ?: return
+        val source = preview.output ?: return
+        if (preview.outputAction != null) return
+        val pending = preview.copy(outputAction = action, outputMessage = null)
+        CaptureSession.status = pending
+        val result = withContext(Dispatchers.IO) { runCatching { write(source) } }
+        if (CaptureSession.status === pending) {
+            CaptureSession.status = preview.copy(
+                outputMessage = if (result.isSuccess) successMessage else "輸出失敗，來源圖片仍保留，請重試。",
+            )
+        }
+    }
 
     fun saveToGallery(
         context: Context,

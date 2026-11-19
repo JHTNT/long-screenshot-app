@@ -8,10 +8,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
@@ -35,6 +35,7 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.TextView
+import androidx.compose.ui.graphics.toArgb
 import java.io.FileOutputStream
 import kotlin.math.max
 
@@ -141,10 +142,9 @@ class CaptureService : Service() {
         } catch (error: Throwable) {
             stopping = true
             releaseProjection()
-            CaptureSession.destroy()
-            CaptureSession.status = CaptureStatus.Failed(
-                error.message ?: "無法開始螢幕擷取，請重新授權。",
-            )
+            if (CaptureSession.destroy()) {
+                CaptureSession.status = CaptureStatus.Failed(error.message ?: "無法開始螢幕擷取，請重新授權。")
+            }
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -308,8 +308,7 @@ class CaptureService : Service() {
         releaseProjection()
         stopForeground(STOP_FOREGROUND_REMOVE)
         if (count == 0) {
-            CaptureSession.destroy()
-            CaptureSession.status = CaptureStatus.Failed("尚未擷取任何畫面。")
+            if (CaptureSession.destroy()) CaptureSession.status = CaptureStatus.Failed("尚未擷取任何畫面。")
             stopSelf()
             return
         }
@@ -325,8 +324,7 @@ class CaptureService : Service() {
         }
         stopping = true
         releaseProjection()
-        val deleted = CaptureSession.destroy()
-        if (!deleted) CaptureSession.status = CaptureStatus.Failed("暫存刪除失敗，尚未宣稱銷毀。", count)
+        CaptureSession.destroy()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -574,17 +572,25 @@ class CaptureService : Service() {
     }
 
     private fun showOverlay() {
+        val preferences = getSharedPreferences(PreferencesName, MODE_PRIVATE)
+        val colors = themedColorScheme(
+            this,
+            resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES,
+            androidx.compose.ui.graphics.Color(preferences.getInt(AccentPreference, DefaultAccent.toArgb())),
+            preferences.getBoolean(SystemColorsPreference, false),
+        )
         val size = 56.dp
         val container = FrameLayout(this).apply {
             contentDescription = "擷取目前畫面"
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
-                setColor(Color.rgb(227, 74, 40))
+                setColor(colors.primary.toArgb())
             }
             elevation = 12.dp.toFloat()
         }
         val camera = ImageView(this).apply {
             setImageResource(R.drawable.ic_capture)
+            setColorFilter(colors.onPrimary.toArgb())
             contentDescription = null
             scaleType = ImageView.ScaleType.CENTER_INSIDE
             setPadding(12.dp, 12.dp, 12.dp, 12.dp)
@@ -595,11 +601,12 @@ class CaptureService : Service() {
                 id = BADGE_ID
                 text = "0"
                 gravity = Gravity.CENTER
-                setTextColor(Color.WHITE)
+                setTextColor(colors.inverseOnSurface.toArgb())
                 textSize = 11f
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.OVAL
-                    setColor(Color.rgb(25, 25, 22))
+                    setColor(colors.inverseSurface.toArgb())
+                    setStroke(1.dp, colors.surface.toArgb())
                 }
             },
             FrameLayout.LayoutParams(20.dp, 20.dp, Gravity.TOP or Gravity.END),

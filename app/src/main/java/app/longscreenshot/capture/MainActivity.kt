@@ -22,6 +22,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -41,6 +42,7 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.selection.selectable
@@ -49,16 +51,21 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RangeSlider
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -69,20 +76,23 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.Typography
-import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
@@ -100,24 +110,23 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-private val Paper = Color(0xFF111310)
-private val Ink = Color(0xFFF2F0E9)
-private val Quiet = Color(0xFFAAA9A2)
-
 private val AccentPresets = listOf(
+    DefaultAccent,
     Color(0xFFFF7353),
     Color(0xFFFFA94D),
     Color(0xFFFFD43B),
@@ -128,9 +137,8 @@ private val AccentPresets = listOf(
     Color(0xFF748FFC),
     Color(0xFFB197FC),
     Color(0xFFF783AC),
+    Color(0xFF868E96),
 )
-private const val PreferencesName = "appearance"
-private const val AccentPreference = "accent"
 
 private enum class PermissionStep { Overlay, Notification }
 
@@ -152,10 +160,11 @@ class MainActivity : ComponentActivity() {
     private var permissionStep by mutableStateOf<PermissionStep?>(null)
     private var notificationAsked = false
     private var homeMessage by mutableStateOf<String?>(null)
+    private var homeMessageIsError by mutableStateOf(false)
     private var showCancelDialog by mutableStateOf(false)
-    private var outputBusy by mutableStateOf(false)
-    private var outputMessage by mutableStateOf<String?>(null)
-    private var accent by mutableStateOf(AccentPresets.first())
+    private var manualBusy by mutableStateOf(false)
+    private var accent by mutableStateOf(DefaultAccent)
+    private var systemColors by mutableStateOf(false)
     private var stitchGeneration = 0
     private val editBackStack = ArrayDeque<CaptureStatus>()
 
@@ -167,13 +176,16 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         val preferences = getSharedPreferences(PreferencesName, MODE_PRIVATE)
-        accent = Color(preferences.getInt(AccentPreference, AccentPresets.first().toArgb()))
+        accent = Color(preferences.getInt(AccentPreference, DefaultAccent.toArgb()))
+        systemColors = preferences.getBoolean(SystemColorsPreference, false)
 
         if (!CaptureSession.cleanOrphans(this)) {
             homeMessage = "部分舊暫存無法清除，請稍後再試。"
+            homeMessageIsError = true
         }
         if (!CaptureOutput.cleanExpiredShares(this)) {
             homeMessage = "部分過期剪貼簿圖片無法清除，請稍後再試。"
+            homeMessageIsError = true
         }
 
         overlayLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
@@ -188,6 +200,7 @@ class MainActivity : ComponentActivity() {
             if (result.resultCode != Activity.RESULT_OK || data == null) {
                 CaptureSession.status = CaptureStatus.Idle
                 homeMessage = "已取消螢幕擷取。"
+                homeMessageIsError = false
                 return@registerForActivityResult
             }
             CaptureSession.status = CaptureStatus.Starting
@@ -198,8 +211,11 @@ class MainActivity : ComponentActivity() {
         }
 
         handleIntent(intent)
+        val appContext = applicationContext
+        // 輸出屬於擷取工作階段，畫面重建時仍須完成。
+        val outputScope = CoroutineScope(Dispatchers.Main.immediate)
         setContent {
-            LongScreenshotTheme(accent) {
+            LongScreenshotTheme(accent, systemColors) {
                 BackHandler(
                     enabled = permissionStep != null || CaptureSession.status !is CaptureStatus.Idle,
                     onBack = ::navigateBack,
@@ -208,14 +224,23 @@ class MainActivity : ComponentActivity() {
                     status = CaptureSession.status,
                     permissionStep = permissionStep,
                     homeMessage = homeMessage,
+                    homeMessageIsError = homeMessageIsError,
                     accent = accent,
+                    systemColors = systemColors,
+                    onSystemColorsChange = {
+                        systemColors = it
+                        preferences.edit().putBoolean(SystemColorsPreference, it).apply()
+                    },
                     onAccentChange = {
                         accent = it
-                        preferences.edit().putInt(AccentPreference, it.toArgb()).apply()
+                        systemColors = false
+                        preferences.edit().putInt(AccentPreference, it.toArgb())
+                            .putBoolean(SystemColorsPreference, false).apply()
                     },
+                    onBack = ::navigateBack,
                     onStart = {
                         homeMessage = null
-                        outputMessage = null
+                        homeMessageIsError = false
                         notificationAsked = false
                         editBackStack.clear()
                         continuePermissionFlow()
@@ -232,16 +257,23 @@ class MainActivity : ComponentActivity() {
                     onManual = ::openManualEditor,
                     onManualApply = ::applyManualPlan,
                     onCancel = { showCancelDialog = true },
-                    outputBusy = outputBusy,
-                    outputMessage = outputMessage,
-                    onSave = { format, crop -> runOutput("已存到相簿", format) {
-                        CaptureOutput.saveToGallery(this, currentOutput(), format, crop)
-                    } },
-                    onCopy = { format, crop -> runOutput("已複製到剪貼簿", format) {
-                        CaptureOutput.copyToClipboard(this, currentOutput(), format, crop)
-                    } },
+                    manualBusy = manualBusy,
+                    onSave = { format, crop ->
+                        outputScope.launch {
+                            CaptureOutput.runOutput("儲存中…", "已存到相簿") { source ->
+                                CaptureOutput.saveToGallery(appContext, source, format, crop)
+                            }
+                        }
+                    },
+                    onCopy = { format, crop ->
+                        outputScope.launch {
+                            CaptureOutput.runOutput("複製中…", "已複製到剪貼簿") { source ->
+                                CaptureOutput.copyToClipboard(appContext, source, format, crop)
+                            }
+                        }
+                    },
                 )
-                if (showCancelDialog) {
+                if (showCancelDialog && (CaptureSession.status as? CaptureStatus.Finished)?.outputAction == null) {
                     AlertDialog(
                         onDismissRequest = { showCancelDialog = false },
                         title = { Text("銷毀這次截圖？") },
@@ -257,12 +289,10 @@ class MainActivity : ComponentActivity() {
                                     else -> {
                                         if (CaptureSession.destroy()) {
                                             Toast.makeText(this, "已銷毀這次截圖", Toast.LENGTH_SHORT).show()
-                                        } else {
-                                            outputMessage = "暫存刪除失敗，尚未宣稱銷毀。"
                                         }
                                     }
                                 }
-                            }) { Text("銷毀", color = MaterialTheme.colorScheme.primary) }
+                            }) { Text("銷毀", color = MaterialTheme.colorScheme.error) }
                         },
                         dismissButton = {
                             TextButton(onClick = { showCancelDialog = false }) { Text("繼續拼接") }
@@ -298,7 +328,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleIntent(intent: Intent?) {
-        if (intent?.action == CaptureService.ACTION_CONFIRM_CANCEL) showCancelDialog = true
+        if (intent?.action == CaptureService.ACTION_CONFIRM_CANCEL &&
+            (CaptureSession.status as? CaptureStatus.Finished)?.outputAction == null
+        ) showCancelDialog = true
     }
 
     private fun navigateBack() {
@@ -320,20 +352,26 @@ class MainActivity : ComponentActivity() {
                 CaptureSession.status = checkNotNull(previousCaptureScreen(status))
             }
             is CaptureStatus.Manual -> {
-                if (outputBusy) {
+                if (manualBusy) {
                     stitchGeneration += 1
-                    outputBusy = false
+                    manualBusy = false
                 }
                 returnToPreviousEdit(status.count)
             }
-            is CaptureStatus.Finished -> if (!outputBusy) returnToPreviousEdit(status.count)
+            is CaptureStatus.Finished -> if (status.outputAction == null) {
+                returnToPreviousEdit(status.count)
+            }
             is CaptureStatus.SelectingRegion -> if (status.forCapture) {
                 startService(CaptureService.actionIntent(this, CaptureService.ACTION_RESUME))
                 moveTaskToBack(true)
             } else {
                 CaptureSession.status = checkNotNull(previousCaptureScreen(status))
             }
-            is CaptureStatus.Failed -> CaptureSession.status = checkNotNull(previousCaptureScreen(status))
+            is CaptureStatus.Failed -> if (status.retainedCount == 0) {
+                CaptureSession.destroy()
+            } else {
+                CaptureSession.status = checkNotNull(previousCaptureScreen(status))
+            }
             CaptureStatus.Idle -> Unit
         }
     }
@@ -460,8 +498,9 @@ class MainActivity : ComponentActivity() {
 
     private fun openManualEditor() {
         val finished = CaptureSession.status as? CaptureStatus.Finished ?: return
+        if (finished.outputAction != null) return
         val plan = finished.manualPlan ?: return
-        editBackStack.addLast(finished)
+        editBackStack.addLast(finished.copy(outputMessage = null))
         CaptureSession.status = CaptureStatus.Manual(
             finished.count,
             plan,
@@ -471,8 +510,8 @@ class MainActivity : ComponentActivity() {
 
     private fun applyManualPlan(plan: ManualStitchPlan) {
         val editing = CaptureSession.status as? CaptureStatus.Manual ?: return
-        if (outputBusy || !plan.isReady()) return
-        outputBusy = true
+        if (manualBusy || !plan.isReady()) return
+        manualBusy = true
         val generation = ++stitchGeneration
         val operationTarget = CaptureSession.resultFile().resolveSibling("result-$generation.png")
         Thread({
@@ -488,7 +527,7 @@ class MainActivity : ComponentActivity() {
                     operationTarget.delete()
                     return@runOnUiThread
                 }
-                outputBusy = false
+                manualBusy = false
                 val committed = result.map(::promoteResult)
                 CaptureSession.status = committed.fold(
                     onSuccess = {
@@ -522,30 +561,6 @@ class MainActivity : ComponentActivity() {
         )
         return target
     }
-
-    private fun runOutput(
-        successMessage: String,
-        format: OutputFormat,
-        operation: (OutputFormat) -> Unit,
-    ) {
-        if (outputBusy) return
-        outputBusy = true
-        outputMessage = null
-        Thread({
-            val error = runCatching { operation(format) }.exceptionOrNull()
-            runOnUiThread {
-                outputBusy = false
-                if (error != null) {
-                    outputMessage = "輸出失敗，來源圖片仍保留，請重試。"
-                } else {
-                    outputMessage = successMessage
-                }
-            }
-        }, "capture-output").start()
-    }
-
-    private fun currentOutput() =
-        checkNotNull((CaptureSession.status as? CaptureStatus.Finished)?.output) { "尚無可輸出的成品" }
 }
 
 @Composable
@@ -553,8 +568,12 @@ private fun App(
     status: CaptureStatus,
     permissionStep: PermissionStep?,
     homeMessage: String?,
+    homeMessageIsError: Boolean,
     accent: Color,
+    systemColors: Boolean,
+    onSystemColorsChange: (Boolean) -> Unit,
     onAccentChange: (Color) -> Unit,
+    onBack: () -> Unit,
     onStart: () -> Unit,
     onPermission: () -> Unit,
     onFinish: () -> Unit,
@@ -566,17 +585,19 @@ private fun App(
     onManual: () -> Unit,
     onManualApply: (ManualStitchPlan) -> Unit,
     onCancel: () -> Unit,
-    outputBusy: Boolean,
-    outputMessage: String?,
+    manualBusy: Boolean,
     onSave: (OutputFormat, ClosedFloatingPointRange<Float>) -> Unit,
     onCopy: (OutputFormat, ClosedFloatingPointRange<Float>) -> Unit,
 ) {
-    Surface(color = Paper, modifier = Modifier.fillMaxSize()) {
+    Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxSize()) {
         when (val target = permissionStep ?: status) {
-            is PermissionStep -> PermissionScreen(target, onPermission)
+            is PermissionStep -> PermissionScreen(target, onPermission, onBack)
             CaptureStatus.Idle -> HomeScreen(
                 homeMessage,
+                homeMessageIsError,
                 accent,
+                systemColors,
+                onSystemColorsChange,
                 onAccentChange,
                 onStart,
             )
@@ -584,6 +605,7 @@ private fun App(
             is CaptureStatus.Capturing -> CapturingScreen(
                 target, onFinish, onCancel, onDelete, onGuideRegion = onGuideRegion,
                 onReturnToCapture = onReturnToCapture,
+                onBack = onBack,
             )
             is CaptureStatus.Reviewing -> CapturingScreen(
                 status = CaptureStatus.Capturing(target.count, target.message),
@@ -593,6 +615,7 @@ private fun App(
                 onCancel = onCancel,
                 onDelete = onReviewDelete,
                 active = false,
+                onBack = onBack,
             )
             is CaptureStatus.SelectingRegion -> RegionSelectionScreen(
                 source = CaptureSession.sourceFile(if (target.forCapture) target.count else 1),
@@ -600,6 +623,7 @@ private fun App(
                 initialRegion = CaptureSession.contentRegion,
                 onConfirm = onRegionConfirm,
                 onCancel = onCancel,
+                onBack = onBack,
             )
             is CaptureStatus.Stitching -> CenterStatus(
                 "正在自動拼接",
@@ -608,24 +632,34 @@ private fun App(
             is CaptureStatus.Manual -> ManualStitchScreen(
                 sources = (1..target.count).map(CaptureSession::sourceFile),
                 initialPlan = target.plan,
-                busy = outputBusy,
+                busy = manualBusy,
                 message = target.message,
                 onApply = onManualApply,
                 onCancel = onCancel,
+                onBack = onBack,
             )
-            is CaptureStatus.Finished -> PreviewScreen(
-                sources = target.output?.let(::listOf)
-                    ?: (1..target.count).map(CaptureSession::sourceFile),
-                canOutput = target.output != null,
-                busy = outputBusy,
-                message = outputMessage ?: target.message,
-                manualPlan = target.manualPlan,
-                onManual = onManual,
-                onSave = onSave,
-                onCopy = onCopy,
-                onDestroy = onCancel,
-            )
-            is CaptureStatus.Failed -> FailureScreen(target, onCancel)
+            is CaptureStatus.Finished -> key(CaptureSession.directory?.path) {
+                PreviewScreen(
+                    sources = target.output?.let(::listOf)
+                        ?: (1..target.count).map(CaptureSession::sourceFile),
+                    canOutput = target.output != null,
+                    busy = target.outputAction != null,
+                    busyAction = target.outputAction,
+                    statusMessage = target.message,
+                    outputMessage = target.outputMessage,
+                    onOutputMessageConsumed = {
+                        if (CaptureSession.status === target) CaptureSession.status = target.copy(outputMessage = null)
+                    },
+                    manualPlan = target.manualPlan,
+                    onManual = onManual,
+                    onSave = onSave,
+                    onCopy = onCopy,
+                    onDestroy = onCancel,
+                    onBack = onBack,
+                    sourceCount = target.count,
+                )
+            }
+            is CaptureStatus.Failed -> FailureScreen(target, onCancel, onBack)
             else -> Unit
         }
     }
@@ -634,48 +668,96 @@ private fun App(
 @Composable
 private fun HomeScreen(
     message: String?,
+    messageIsError: Boolean,
     accent: Color,
+    systemColors: Boolean,
+    onSystemColorsChange: (Boolean) -> Unit,
     onAccentChange: (Color) -> Unit,
     onStart: () -> Unit,
 ) {
     var showAccentDialog by remember { mutableStateOf(false) }
 
     Column(
-        modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(20.dp),
+        modifier = Modifier.fillMaxSize().safeDrawingPadding(),
     ) {
         AppHeader(onThemeClick = { showAccentDialog = true })
-        Spacer(Modifier.height(48.dp))
-        Column {
-            Text("擷取可捲動畫面", style = MaterialTheme.typography.titleLarge, color = Ink)
-            Spacer(Modifier.height(10.dp))
+        Column(
+            modifier = Modifier.weight(1f).verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+        ) {
             Text(
-                "切換到目標 App，捲動畫面並點擊懸浮按鈕。",
-                style = MaterialTheme.typography.bodyLarge,
-                color = Quiet,
+                "逐張擷取其他 App 的畫面，自動拼接成長圖。可調整接縫、裁切，再儲存或複製。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Spacer(Modifier.height(10.dp))
-            Text("第一張截圖後，框出可捲動內容，排除上下固定區域，再依提示線保留重疊內容。", color = Quiet)
+            Spacer(Modifier.height(24.dp))
+            listOf(
+                "開啟要截圖的 App" to "用懸浮按鈕擷取第一張。",
+                "框選內容，捲動擷取" to "排除上下固定區域，依提示線保留重疊。",
+                "檢查長圖，再輸出" to "存到相簿或複製到剪貼簿。",
+            ).forEachIndexed { index, (title, detail) ->
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer) {
+                        Box(Modifier.size(28.dp), contentAlignment = Alignment.Center) {
+                            Text(
+                                "${index + 1}",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            )
+                        }
+                    }
+                    Column {
+                        Text(title, style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            detail,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+            }
             if (message != null) {
-                Spacer(Modifier.height(14.dp))
-                Text(message, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodyMedium)
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = if (messageIsError) MaterialTheme.colorScheme.errorContainer
+                    else MaterialTheme.colorScheme.surfaceContainer,
+                ) {
+                    Text(
+                        message,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        color = if (messageIsError) MaterialTheme.colorScheme.onErrorContainer
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
             }
         }
-        Spacer(Modifier.weight(1f))
-        Button(
-            onClick = onStart,
-            modifier = Modifier.fillMaxWidth().height(52.dp),
-            shape = RoundedCornerShape(10.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = Paper,
-            ),
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
         ) {
-            Text("開始擷取", fontWeight = FontWeight.SemiBold)
+            Text(
+                "圖片只在這台裝置處理",
+                Modifier.fillMaxWidth(),
+                textAlign = TextAlign.Center,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelMedium,
+            )
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = onStart,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("開始擷取", fontWeight = FontWeight.SemiBold)
+            }
         }
     }
     if (showAccentDialog) {
         AccentDialog(
             accent = accent,
+            systemColors = systemColors,
+            onSystemColorsChange = onSystemColorsChange,
             onAccentChange = onAccentChange,
             onDismiss = { showAccentDialog = false },
         )
@@ -685,51 +767,95 @@ private fun HomeScreen(
 @Composable
 private fun AccentDialog(
     accent: Color,
+    systemColors: Boolean,
+    onSystemColorsChange: (Boolean) -> Unit,
     onAccentChange: (Color) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val hsv = FloatArray(3).also { android.graphics.Color.colorToHSV(accent.toArgb(), it) }
+    val manualAlpha = if (systemColors) 0.55f else 1f
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("主題顏色") },
         text = {
-            Column {
-                AccentPresets.chunked(5).forEachIndexed { rowIndex, row ->
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                        Modifier.fillMaxWidth().toggleable(
+                            value = systemColors, role = Role.Switch, onValueChange = onSystemColorsChange,
+                        ),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        row.forEachIndexed { columnIndex, color ->
-                            Surface(
-                                modifier = Modifier
-                                    .size(48.dp)
-                                    .selectable(
-                                        selected = color == accent,
-                                        onClick = { onAccentChange(color) },
-                                        role = Role.RadioButton,
-                                    )
-                                    .semantics {
-                                        contentDescription =
-                                            "預設顏色 ${rowIndex * 5 + columnIndex + 1}"
-                                    },
-                                shape = CircleShape,
-                                color = color,
-                                border = BorderStroke(
-                                    if (color == accent) 3.dp else 1.dp,
-                                    if (color == accent) Ink else color.copy(alpha = 0.45f),
-                                ),
-                            ) {}
+                        Text("使用系統配色", Modifier.weight(1f))
+                        Switch(checked = systemColors, onCheckedChange = null)
+                    }
+                    if (systemColors) {
+                        Text(
+                            "點選下方顏色將改用自訂主題色",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                }
+                Column(Modifier.alpha(manualAlpha)) {
+                    AccentPresets.chunked(4).forEachIndexed { rowIndex, row ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            row.forEachIndexed { columnIndex, color ->
+                                Surface(
+                                    modifier = Modifier
+                                        .size(48.dp)
+                                        .selectable(
+                                            selected = !systemColors && color == accent,
+                                            onClick = { onAccentChange(color) },
+                                            role = Role.RadioButton,
+                                        )
+                                        .semantics {
+                                            contentDescription =
+                                                "預設顏色 ${rowIndex * 4 + columnIndex + 1}"
+                                        },
+                                    shape = CircleShape,
+                                    color = color,
+                                    border = BorderStroke(
+                                        if (!systemColors && color == accent) 3.dp else 1.dp,
+                                        if (!systemColors && color == accent) MaterialTheme.colorScheme.onSurface
+                                        else color.copy(alpha = 0.45f),
+                                    ),
+                                ) {}
+                            }
+                            repeat(4 - row.size) { Spacer(Modifier.size(48.dp)) }
                         }
+                        Spacer(Modifier.height(10.dp))
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text("自訂顏色", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "實際套用",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Surface(
+                            modifier = Modifier.size(20.dp),
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.primary,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                        ) {}
                     }
                     Spacer(Modifier.height(10.dp))
+                    ColorPlane(hsv, onAccentChange)
+                    Spacer(Modifier.height(12.dp))
+                    HueBar(hsv, onAccentChange)
                 }
-                Spacer(Modifier.height(6.dp))
-                Text("自訂顏色", style = MaterialTheme.typography.titleMedium)
-                Spacer(Modifier.height(10.dp))
-                ColorPlane(hsv, onAccentChange)
-                Spacer(Modifier.height(12.dp))
-                HueBar(hsv, onAccentChange)
             }
         },
         confirmButton = {
@@ -740,8 +866,8 @@ private fun AccentDialog(
 
 @Composable
 private fun ColorPlane(hsv: FloatArray, onColorChange: (Color) -> Unit) {
-    val saturation = (hsv[1] / 0.50f).coerceIn(0f, 1f)
-    val darkness = ((1f - hsv[2]) / 0.10f).coerceIn(0f, 1f)
+    val saturation = hsv[1].coerceIn(0f, 1f)
+    val darkness = ((1f - hsv[2]) / 0.75f).coerceIn(0f, 1f)
     val update: (Offset, Size) -> Unit = { point, bounds ->
         onColorChange(pickerColor(hsv[0], point.x / bounds.width, point.y / bounds.height))
     }
@@ -755,16 +881,16 @@ private fun ColorPlane(hsv: FloatArray, onColorChange: (Color) -> Unit) {
     ) {
         drawRect(
             Brush.horizontalGradient(
-                listOf(Color.White, Color.hsv(hsv[0], 0.50f, 1f)),
+                listOf(Color.White, Color.hsv(hsv[0], 1f, 1f)),
             ),
         )
         drawRect(
             Brush.verticalGradient(
-                listOf(Color.Transparent, Color.Black.copy(alpha = 0.10f)),
+                listOf(Color.Transparent, Color.Black.copy(alpha = 0.75f)),
             ),
         )
         val marker = Offset(size.width * saturation, size.height * darkness)
-        drawCircle(Ink, 9.dp.toPx(), marker, style = Stroke(2.dp.toPx()))
+        drawCircle(Color.Black, 9.dp.toPx(), marker, style = Stroke(2.dp.toPx()))
         drawCircle(Color.White, 7.dp.toPx(), marker, style = Stroke(2.dp.toPx()))
     }
 }
@@ -775,8 +901,8 @@ private fun HueBar(hsv: FloatArray, onColorChange: (Color) -> Unit) {
         onColorChange(
             pickerColor(
                 point.x / bounds.width * 360f,
-                hsv[1] / 0.50f,
-                (1f - hsv[2]) / 0.10f,
+                hsv[1],
+                (1f - hsv[2]) / 0.75f,
             ),
         )
     }
@@ -794,7 +920,7 @@ private fun HueBar(hsv: FloatArray, onColorChange: (Color) -> Unit) {
             ),
         )
         val markerX = size.width * hsv[0] / 360f
-        drawLine(Ink, Offset(markerX, 0f), Offset(markerX, size.height), 4.dp.toPx())
+        drawLine(Color.Black, Offset(markerX, 0f), Offset(markerX, size.height), 4.dp.toPx())
         drawLine(Color.White, Offset(markerX, 0f), Offset(markerX, size.height), 2.dp.toPx())
     }
 }
@@ -818,12 +944,12 @@ private fun Modifier.colorPointer(onPosition: (Offset, Size) -> Unit) = composed
 internal fun pickerColor(hue: Float, xFraction: Float, yFraction: Float): Color =
     Color.hsv(
         ((hue % 360f) + 360f) % 360f,
-        xFraction.coerceIn(0f, 1f) * 0.50f,
-        1f - yFraction.coerceIn(0f, 1f) * 0.10f,
+        xFraction.coerceIn(0f, 1f),
+        1f - yFraction.coerceIn(0f, 1f) * 0.75f,
     )
 
 @Composable
-private fun PermissionScreen(step: PermissionStep, onContinue: () -> Unit) {
+private fun PermissionScreen(step: PermissionStep, onContinue: () -> Unit, onBack: () -> Unit) {
     val (number, title, body, button) = when (step) {
         PermissionStep.Overlay -> listOf(
             "設定 1 / 2", "允許懸浮按鈕", "讓截圖按鈕顯示在其他 App 上方。", "前往設定",
@@ -833,22 +959,22 @@ private fun PermissionScreen(step: PermissionStep, onContinue: () -> Unit) {
         )
     }
     Column(
-        Modifier.fillMaxSize().safeDrawingPadding().padding(20.dp),
+        Modifier.fillMaxSize().safeDrawingPadding(),
     ) {
-        AppHeader(number)
-        Spacer(Modifier.height(48.dp))
-        Column {
-            Text(title, style = MaterialTheme.typography.titleLarge, color = Ink)
+        AppHeader(number, onBack = onBack)
+        Column(
+            Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+        ) {
+            Spacer(Modifier.height(12.dp))
+            Text(title, style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurface)
             Spacer(Modifier.height(10.dp))
-            Text(body, style = MaterialTheme.typography.bodyLarge, color = Quiet)
+            Text(body, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.weight(1f))
+            Button(
+                onClick = onContinue,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text(button, fontWeight = FontWeight.SemiBold) }
         }
-        Spacer(Modifier.weight(1f))
-        Button(
-            onClick = onContinue,
-            modifier = Modifier.fillMaxWidth().height(52.dp),
-            shape = RoundedCornerShape(10.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = Ink),
-        ) { Text(button, fontWeight = FontWeight.SemiBold) }
     }
 }
 
@@ -861,74 +987,72 @@ private fun CapturingScreen(
     active: Boolean = true,
     onGuideRegion: (() -> Unit)? = null,
     onReturnToCapture: (() -> Unit)? = null,
+    onBack: () -> Unit,
 ) {
     var deleteIndex by remember { mutableStateOf<Int?>(null) }
 
     Column(
-        Modifier.fillMaxSize().safeDrawingPadding().padding(20.dp),
+        Modifier.fillMaxSize().safeDrawingPadding(),
     ) {
-        AppHeader(if (active) "擷取中" else "已完成擷取")
-        Spacer(Modifier.height(28.dp))
-        Column {
-            Text("已擷取 ${status.count} 張", style = MaterialTheme.typography.titleLarge, color = Ink)
-            Spacer(Modifier.height(10.dp))
+        AppHeader(if (active) "擷取中" else "已完成擷取", onBack = onBack)
+        Column(
+            Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+        ) {
+            Text("已擷取 ${status.count} 張", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurface)
+            Spacer(Modifier.height(8.dp))
             Text(
                 status.message ?: if (active) "切回要截圖的 App 繼續擷取。"
                 else "可檢查截圖後再次進入區域選擇。",
                 style = MaterialTheme.typography.bodyLarge,
-                color = Quiet,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-        }
-        if (active && status.count > 0 && onGuideRegion != null) {
-            TextButton(onClick = onGuideRegion) { Text("調整上下固定區域") }
-        }
-        Spacer(Modifier.height(20.dp))
-        LazyColumn(
-            modifier = Modifier.fillMaxWidth().weight(1f),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            itemsIndexed(
-                (1..status.count).map(CaptureSession::sourceFile).chunked(2),
-                key = { _, row -> row.first().path },
-            ) { rowIndex, row ->
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    row.forEachIndexed { columnIndex, source ->
-                        CaptureThumbnail(
-                            source = source,
-                            index = rowIndex * 2 + columnIndex,
-                            count = status.count,
-                            onDelete = { deleteIndex = rowIndex * 2 + columnIndex + 1 },
-                            modifier = Modifier.weight(1f),
-                        )
+            if (active && status.count > 0 && onGuideRegion != null) {
+                TextButton(onClick = onGuideRegion) { Text("調整上下固定區域") }
+            }
+            Spacer(Modifier.height(16.dp))
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                itemsIndexed(
+                    (1..status.count).map(CaptureSession::sourceFile).chunked(2),
+                    key = { _, row -> row.first().path },
+                ) { rowIndex, row ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        row.forEachIndexed { columnIndex, source ->
+                            CaptureThumbnail(
+                                source = source,
+                                index = rowIndex * 2 + columnIndex,
+                                count = status.count,
+                                onDelete = { deleteIndex = rowIndex * 2 + columnIndex + 1 },
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                        if (row.size == 1) Spacer(Modifier.weight(1f))
                     }
-                    if (row.size == 1) Spacer(Modifier.weight(1f))
                 }
             }
-        }
-        Spacer(Modifier.height(20.dp))
-        Column {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (active && onReturnToCapture != null) {
-                    OutlinedButton(
-                        onClick = onReturnToCapture,
-                        modifier = Modifier.weight(1f).height(52.dp),
-                        shape = RoundedCornerShape(10.dp),
-                    ) { Text("返回截圖") }
+            Spacer(Modifier.height(16.dp))
+            Column {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (active && onReturnToCapture != null) {
+                        OutlinedButton(
+                            onClick = onReturnToCapture,
+                            modifier = Modifier.weight(1f),
+                        ) { Text("返回截圖") }
+                    }
+                    Button(
+                        onClick = onFinish,
+                        enabled = active || status.count > 0,
+                        modifier = Modifier.weight(1f),
+                    ) { Text(if (active) "完成" else "選擇拼接區域") }
                 }
-                Button(
-                    onClick = onFinish,
-                    enabled = active || status.count > 0,
-                    modifier = Modifier.weight(1f).height(52.dp),
-                    shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Ink),
-                ) { Text("完成") }
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = onCancel,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("取消", color = MaterialTheme.colorScheme.error) }
             }
-            Spacer(Modifier.height(8.dp))
-            OutlinedButton(
-                onClick = onCancel,
-                modifier = Modifier.fillMaxWidth().height(48.dp),
-                shape = RoundedCornerShape(10.dp),
-            ) { Text("取消", color = MaterialTheme.colorScheme.primary) }
         }
     }
     deleteIndex?.let { index ->
@@ -940,7 +1064,7 @@ private fun CapturingScreen(
                 TextButton(onClick = {
                     deleteIndex = null
                     onDelete(index)
-                }) { Text("刪除", color = MaterialTheme.colorScheme.primary) }
+                }) { Text("刪除", color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = {
                 TextButton(onClick = { deleteIndex = null }) { Text("保留") }
@@ -963,7 +1087,7 @@ private fun CaptureThumbnail(
 
     Surface(
         modifier = modifier.combinedClickable(onClick = {}, onLongClick = onDelete),
-        color = Color(0xFF20231E),
+        color = MaterialTheme.colorScheme.surfaceContainer,
         shape = RoundedCornerShape(8.dp),
     ) {
         when (val preview = loaded) {
@@ -990,6 +1114,7 @@ private fun RegionSelectionScreen(
     initialRegion: VerticalRegion?,
     onConfirm: (ClosedFloatingPointRange<Float>) -> Unit,
     onCancel: () -> Unit,
+    onBack: () -> Unit,
 ) {
     var range by remember(source.path, forCapture) { mutableStateOf(0.12f..0.78f) }
     val loaded by produceState<LoadedPreview?>(null, source.path) {
@@ -1004,68 +1129,70 @@ private fun RegionSelectionScreen(
     }
 
     Column(
-        Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 16.dp, vertical = 8.dp),
+        Modifier.fillMaxSize().safeDrawingPadding(),
     ) {
-        AppHeader(if (forCapture) "排除固定區域" else "確認拼接區域")
-        Spacer(Modifier.height(8.dp))
-        Text(
-            if (forCapture) "把上方標題列、下方工具列或輸入框留在暗色區域，只框出會捲動的內容。"
-            else "已沿用擷取時的範圍，可調整後拼接。首張頂端與末張底端會保留。",
-            color = Quiet,
-        )
-        Spacer(Modifier.height(8.dp))
-        Surface(
-            modifier = Modifier.fillMaxWidth().weight(1f),
-            color = Color(0xFF20231E),
-            shape = RoundedCornerShape(8.dp),
+        AppHeader(if (forCapture) "排除固定區域" else "確認拼接區域", onBack = onBack)
+        Column(
+            Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
         ) {
-            when (val preview = loaded) {
-                null -> Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center,
-                ) {
-                    CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-                }
-                else -> Box {
-                    Image(
-                        bitmap = preview.bitmap.asImageBitmap(),
-                        contentDescription = "選擇要拼接的內容區域",
-                        modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Fit,
-                    )
-                    CropOverlay(
-                        modifier = Modifier.matchParentSize(),
-                        imageWidth = preview.bitmap.width,
-                        imageHeight = preview.bitmap.height,
-                        range = range,
-                        minimumRange = 0.25f,
-                        fitImage = true,
-                        onRangeChange = { range = it },
-                    )
+            Text(
+                if (forCapture) "把上方標題列、下方工具列或輸入框留在暗色區域，只框出會捲動的內容。"
+                else "已沿用擷取時的範圍，可調整後拼接。首張頂端與末張底端會保留。",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+            Surface(
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                color = MaterialTheme.colorScheme.surfaceContainer,
+                shape = RoundedCornerShape(8.dp),
+            ) {
+                when (val preview = loaded) {
+                    null -> Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center,
+                    ) {
+                        CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                    }
+                    else -> Box(Modifier.fillMaxSize().padding(vertical = 12.dp)) {
+                        Image(
+                            bitmap = preview.bitmap.asImageBitmap(),
+                            contentDescription = "選擇要拼接的內容區域",
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Fit,
+                        )
+                        CropOverlay(
+                            modifier = Modifier.matchParentSize(),
+                            imageWidth = preview.bitmap.width,
+                            imageHeight = preview.bitmap.height,
+                            range = range,
+                            minimumRange = 0.25f,
+                            fitImage = true,
+                            onRangeChange = { range = it },
+                        )
+                    }
                 }
             }
-        }
-        Spacer(Modifier.height(6.dp))
-        Text(
-            if (forCapture) "上界到虛線是重疊範圍，建議保留 15–25%；無法確認時，請往回捲一些。"
-            else "拖曳上下邊界線調整",
-            color = Quiet,
-        )
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            OutlinedButton(
-                onClick = onCancel,
-                modifier = Modifier.weight(1f).height(48.dp),
-                shape = RoundedCornerShape(10.dp),
-            ) { Text("不保存", color = MaterialTheme.colorScheme.primary) }
-            Button(
-                onClick = { onConfirm(range) },
-                enabled = loaded != null,
-                modifier = Modifier.weight(2f).height(48.dp),
-                shape = RoundedCornerShape(10.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Ink),
-            ) { Text(if (forCapture) "確認並繼續擷取" else "開始拼接") }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                if (forCapture) "上界到虛線是重疊範圍，建議保留 15–25%；無法確認時，請往回捲一些。"
+                else "拖曳上下邊界線調整",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onCancel,
+                    modifier = Modifier.weight(1f),
+                ) { Text("不保存", color = MaterialTheme.colorScheme.error) }
+                Button(
+                    onClick = { onConfirm(range) },
+                    enabled = loaded != null,
+                    modifier = Modifier.weight(2f),
+                ) { Text(if (forCapture) "確認並繼續擷取" else "開始拼接") }
+            }
         }
     }
 }
@@ -1079,12 +1206,14 @@ internal fun CropOverlay(
     minimumRange: Float,
     fitImage: Boolean,
     enabled: Boolean = true,
+    showHandles: Boolean = true,
     onRangeChange: (ClosedFloatingPointRange<Float>) -> Unit,
 ) {
     val density = androidx.compose.ui.platform.LocalDensity.current
     val currentRange by rememberUpdatedState(range)
     val currentOnRangeChange by rememberUpdatedState(onRangeChange)
     val accentColor = MaterialTheme.colorScheme.primary
+    val handleColor = MaterialTheme.colorScheme.surface
 
     Canvas(
         modifier
@@ -1169,15 +1298,16 @@ internal fun CropOverlay(
         val top = frame.top + frame.height * range.start
         val bottom = frame.top + frame.height * range.endInclusive
         drawRect(
-            Paper.copy(alpha = 0.72f),
+            Color.Black.copy(alpha = 0.65f),
             topLeft = Offset(frame.left, frame.top),
             size = Size(frame.width, (top - frame.top).coerceIn(0f, frame.height)),
         )
         drawRect(
-            Paper.copy(alpha = 0.72f),
+            Color.Black.copy(alpha = 0.65f),
             topLeft = Offset(frame.left, bottom),
             size = Size(frame.width, (frame.bottom - bottom).coerceIn(0f, frame.height)),
         )
+        if (!showHandles) return@Canvas
         drawLine(
             color = accentColor,
             start = Offset(frame.left, top),
@@ -1196,7 +1326,7 @@ internal fun CropOverlay(
             val head = 3.dp.toPx()
             val stroke = 1.5.dp.toPx()
             drawCircle(
-                color = Paper.copy(alpha = 0.9f),
+                color = handleColor,
                 radius = 10.dp.toPx(),
                 center = Offset(centerX, y),
             )
@@ -1279,6 +1409,7 @@ private fun ManualStitchScreen(
     message: String?,
     onApply: (ManualStitchPlan) -> Unit,
     onCancel: () -> Unit,
+    onBack: () -> Unit,
 ) {
     if (initialPlan.seams.isEmpty()) {
         Column(
@@ -1286,7 +1417,7 @@ private fun ManualStitchScreen(
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text("沒有可調整的接縫", color = Ink)
+            Text("沒有可調整的接縫", color = MaterialTheme.colorScheme.onSurface)
             TextButton(onClick = onCancel) { Text("銷毀、不保存") }
         }
         return
@@ -1344,11 +1475,19 @@ private fun ManualStitchScreen(
     }
 
     BoxWithConstraints(Modifier.fillMaxSize().safeDrawingPadding()) {
-        val previewHeight = (maxHeight * 0.40f).coerceIn(120.dp, 360.dp)
-        val compact = maxHeight < 700.dp || androidx.compose.ui.platform.LocalDensity.current.fontScale > 1.25f
-        Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("手動拼接", style = MaterialTheme.typography.titleLarge, color = Ink)
+        val compact = maxHeight < 640.dp || androidx.compose.ui.platform.LocalDensity.current.fontScale > 1.25f
+        val narrowTools = compact || maxWidth < 360.dp
+        val previewHeight = if (compact) (maxHeight * 0.40f).coerceIn(120.dp, 320.dp)
+            else (maxHeight - 400.dp).coerceIn(160.dp, 480.dp)
+        Column(Modifier.fillMaxSize()) {
+            Row(
+                Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                IconButton(onClick = onBack, enabled = !busy) {
+                    Icon(painterResource(R.drawable.ic_arrow_back), contentDescription = "返回")
+                }
+                Text("接縫修正", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurface)
                 Spacer(Modifier.weight(1f))
                 IconButton(
                     onClick = { showResetDialog = true },
@@ -1359,7 +1498,7 @@ private fun ManualStitchScreen(
                         painter = painterResource(R.drawable.ic_reset),
                         contentDescription = null,
                         modifier = Modifier.size(24.dp),
-                        tint = if (busy) Ink.copy(alpha = 0.38f) else Ink,
+                        tint = if (busy) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f) else MaterialTheme.colorScheme.onSurface,
                     )
                 }
                 Box {
@@ -1372,7 +1511,7 @@ private fun ManualStitchScreen(
                             painter = painterResource(R.drawable.ic_more_horiz),
                             contentDescription = null,
                             modifier = Modifier.size(24.dp),
-                            tint = if (busy) Ink.copy(alpha = 0.38f) else Ink,
+                            tint = if (busy) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f) else MaterialTheme.colorScheme.onSurface,
                         )
                     }
                     DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
@@ -1381,247 +1520,288 @@ private fun ManualStitchScreen(
                             onClick = { menuExpanded = false; showDetails = true },
                         )
                         DropdownMenuItem(
-                            text = { Text("銷毀、不保存", color = MaterialTheme.colorScheme.primary) },
+                            text = { Text("銷毀、不保存", color = MaterialTheme.colorScheme.error) },
                             onClick = { menuExpanded = false; onCancel() },
                         )
                     }
                 }
             }
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                OutlinedButton(
-                    onClick = { selectSeam(seamIndex - 1) },
-                    enabled = !busy && seamIndex > 0,
-                    modifier = Modifier.size(48.dp).semantics { contentDescription = "上一處接縫" },
-                    shape = RoundedCornerShape(14.dp),
-                    contentPadding = PaddingValues(0.dp),
-                ) { Text("‹", fontSize = 26.sp) }
-                Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("接縫 ${seamIndex + 1}／${plan.seams.size}", color = Ink,
-                        style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        "第 ${seamIndex + 1}、${seamIndex + 2} 張之間 · " + when {
-                            seam.skipped -> "重複圖片已略過"
-                            seamError != null -> "需要調整"
-                            seam.confirmed -> "已確認"
-                            else -> "待確認"
-                        },
-                        color = Quiet, style = MaterialTheme.typography.labelMedium, textAlign = TextAlign.Center,
-                    )
-                }
-                OutlinedButton(
-                    onClick = { selectSeam(seamIndex + 1) },
-                    enabled = !busy && seamIndex < plan.seams.lastIndex,
-                    modifier = Modifier.size(48.dp).semantics { contentDescription = "下一處接縫" },
-                    shape = RoundedCornerShape(14.dp),
-                    contentPadding = PaddingValues(0.dp),
-                ) { Text("›", fontSize = 26.sp) }
-            }
-            Column(
-                Modifier.weight(1f).then(if (compact) Modifier.verticalScroll(rememberScrollState()) else Modifier),
-            ) {
-                Surface(
-                    modifier = Modifier.fillMaxWidth().height(previewHeight).onSizeChanged { previewSize = it },
-                    color = Color(0xFF20231E), shape = RoundedCornerShape(18.dp),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
+            Column(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    when {
-                        seam.skipped -> Column(
-                            modifier = Modifier.verticalScroll(rememberScrollState()).padding(24.dp),
-                            verticalArrangement = Arrangement.Center,
-                            horizontalAlignment = Alignment.CenterHorizontally,
+                    IconButton(
+                        onClick = { selectSeam(seamIndex - 1) },
+                        enabled = !busy && seamIndex > 0,
+                        modifier = Modifier.size(48.dp).semantics { contentDescription = "上一處接縫" },
+                    ) { Text("‹", fontSize = 26.sp) }
+                    Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("接縫 ${seamIndex + 1}／${plan.seams.size}", color = MaterialTheme.colorScheme.onSurface,
+                            style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "第 ${seamIndex + 1}、${seamIndex + 2} 張之間 · " + when {
+                                seam.skipped -> "重複圖片已略過"
+                                seamError != null -> "需要調整"
+                                seam.confirmed -> "已確認"
+                                else -> "待確認"
+                            },
+                            color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium, textAlign = TextAlign.Center,
+                        )
+                    }
+                    IconButton(
+                        onClick = { selectSeam(seamIndex + 1) },
+                        enabled = !busy && seamIndex < plan.seams.lastIndex,
+                        modifier = Modifier.size(48.dp).semantics { contentDescription = "下一處接縫" },
+                    ) { Text("›", fontSize = 26.sp) }
+                }
+                Box(Modifier.weight(1f).fillMaxWidth()) {
+                    Column(
+                        Modifier.fillMaxSize().then(if (compact) Modifier.verticalScroll(rememberScrollState()) else Modifier),
+                    ) {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth().height(previewHeight).onSizeChanged { previewSize = it },
+                            color = MaterialTheme.colorScheme.surfaceContainer, shape = RoundedCornerShape(18.dp),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
                         ) {
-                            Text("這張內容已經出現過", color = Ink, style = MaterialTheme.typography.titleMedium)
-                            Spacer(Modifier.height(8.dp))
-                            Text("第 ${seamIndex + 2} 張目前不加入成品。\n如果仍需要這張，可以保留後重新對齊。",
-                                color = Quiet, textAlign = TextAlign.Center)
-                            Spacer(Modifier.height(16.dp))
-                            OutlinedButton(onClick = { plan = plan.keepDuplicate(seamIndex) }, enabled = !busy) {
-                                Text("保留這張圖片")
-                            }
-                        }
-                        previous == null || next == null -> Box(contentAlignment = Alignment.Center) {
-                            CircularProgressIndicator()
-                        }
-                        cropMode -> {
-                            val selected = checkNotNull(if (selectedImage == seamIndex) previous else next)
-                            val scale = manualPreviewScale(plan, previewSize.width)
-                            val imageTop = if (selectedImage == seamIndex) 0 else seam.shift
-                            val paddingPx = with(androidx.compose.ui.platform.LocalDensity.current) { 12.dp.roundToPx() }
-                            val cropScroll = remember(seamIndex, selectedImage, previewSize) {
-                                val viewTop = previewViewTop ?: manualSeamViewTop(
-                                    plan.height, plan.crops[seamIndex].bottom, previewSize.height / scale,
+                            when {
+                                seam.skipped -> Column(
+                                    modifier = Modifier.verticalScroll(rememberScrollState()).padding(24.dp),
+                                    verticalArrangement = Arrangement.Center,
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                ) {
+                                    Text("這張內容已經出現過", color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.titleMedium)
+                                    Spacer(Modifier.height(8.dp))
+                                    Text("第 ${seamIndex + 2} 張目前不加入成品。\n如果仍需要這張，可以保留後重新對齊。",
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                                    Spacer(Modifier.height(16.dp))
+                                    OutlinedButton(onClick = { plan = plan.keepDuplicate(seamIndex) }, enabled = !busy) {
+                                        Text("保留這張圖片")
+                                    }
+                                }
+                                previous == null || next == null -> Box(contentAlignment = Alignment.Center) {
+                                    CircularProgressIndicator()
+                                }
+                                cropMode -> {
+                                    val selected = checkNotNull(if (selectedImage == seamIndex) previous else next)
+                                    val scale = manualPreviewScale(plan, previewSize.width)
+                                    val imageTop = if (selectedImage == seamIndex) 0 else seam.shift
+                                    val paddingPx = with(androidx.compose.ui.platform.LocalDensity.current) { 12.dp.roundToPx() }
+                                    val cropScroll = remember(seamIndex, selectedImage, previewSize) {
+                                        val viewTop = previewViewTop ?: manualSeamViewTop(
+                                            plan.height, plan.crops[seamIndex].bottom, previewSize.height / scale,
+                                        )
+                                        ScrollState(manualCropScroll(viewTop, imageTop, scale, paddingPx))
+                                    }
+                                    LaunchedEffect(cropScroll, imageTop, scale, paddingPx) {
+                                        snapshotFlow { cropScroll.value }.collect { scroll ->
+                                            previewViewTop = manualCropViewTop(scroll, imageTop, scale, paddingPx)
+                                        }
+                                    }
+                                    Box(Modifier.fillMaxSize().verticalScroll(cropScroll)) {
+                                        Box(Modifier.padding(vertical = 12.dp)) {
+                                            Image(
+                                                bitmap = selected.bitmap.asImageBitmap(),
+                                                contentDescription = "第 ${selectedImage + 1} 張的裁切預覽",
+                                                modifier = Modifier.fillMaxWidth(), contentScale = ContentScale.FillWidth,
+                                            )
+                                            CropOverlay(
+                                                modifier = Modifier.matchParentSize(),
+                                                imageWidth = selected.bitmap.width, imageHeight = selected.bitmap.height,
+                                                range = (crop.top.toFloat() / plan.height)..(crop.bottom.toFloat() / plan.height),
+                                                minimumRange = 1f / plan.height, fitImage = false, enabled = !busy,
+                                                onRangeChange = { range ->
+                                                    val top = (range.start * plan.height).roundToInt().coerceIn(0, plan.height - 1)
+                                                    val bottom = (range.endInclusive * plan.height).roundToInt().coerceIn(top + 1, plan.height)
+                                                    updateCrop(ManualCrop(top, bottom))
+                                                },
+                                            )
+                                        }
+                                    }
+                                }
+                                else -> ManualSeamCanvas(
+                                    previous = checkNotNull(previous), next = checkNotNull(next),
+                                    plan = plan, seamIndex = seamIndex, mode = previewMode,
+                                    showGuides = showGuides, onDrag = drag, viewportTop = previewViewTop,
+                                    enabled = !busy && previewMode == ManualPreviewMode.Overlap,
+                                    modifier = Modifier.fillMaxSize(),
                                 )
-                                ScrollState(manualCropScroll(viewTop, imageTop, scale, paddingPx))
                             }
-                            LaunchedEffect(cropScroll, imageTop, scale, paddingPx) {
-                                snapshotFlow { cropScroll.value }.collect { scroll ->
-                                    previewViewTop = manualCropViewTop(scroll, imageTop, scale, paddingPx)
+                        }
+                        Text(
+                            when {
+                                seam.skipped -> "略過重複圖片，避免成品出現相同內容。"
+                                cropMode -> "上下捲動查看圖片，拖曳邊界裁切暗色區域。"
+                                previewMode == ManualPreviewMode.Composite -> "檢查接合處的文字與圖案是否連續。"
+                                else -> "上下拖曳預覽，讓兩張圖的重複內容重合。"
+                            },
+                            modifier = Modifier.padding(vertical = 4.dp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium,
+                        )
+                        if (!seam.skipped) {
+                            PrimaryTabRow(selectedTabIndex = if (cropMode) 1 else 0, containerColor = MaterialTheme.colorScheme.surface) {
+                                Tab(selected = !cropMode, onClick = { cropMode = false }, enabled = !busy,
+                                    text = { Text("對齊位置") })
+                                Tab(selected = cropMode, onClick = { cropMode = true }, enabled = !busy,
+                                    text = { Text("裁切邊緣") })
+                            }
+                        }
+                        Column(
+                            modifier = (if (compact) Modifier else Modifier.weight(1f).verticalScroll(rememberScrollState()))
+                                .padding(top = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            if (!seam.skipped && cropMode) {
+                                SegmentedChoiceRow(
+                                    options = listOf("第 ${seamIndex + 1} 張圖片", "第 ${seamIndex + 2} 張圖片"),
+                                    selectedIndex = if (selectedImage == seamIndex) 0 else 1,
+                                    onSelect = { selectedImage = seamIndex + it },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    enabled = !busy,
+                                )
+                                ManualCropSlider(crop, plan.height, !busy, updateCrop)
+                                TextButton(
+                                    onClick = { plan = plan.resetImage(selectedImage) },
+                                    enabled = !busy,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text("還原這張的裁切與對齊", textAlign = TextAlign.Center)
                                 }
-                            }
-                            Box(Modifier.fillMaxSize().verticalScroll(cropScroll)) {
-                                Box(Modifier.padding(vertical = 12.dp)) {
-                                    Image(
-                                        bitmap = selected.bitmap.asImageBitmap(),
-                                        contentDescription = "第 ${selectedImage + 1} 張的裁切預覽",
-                                        modifier = Modifier.fillMaxWidth(), contentScale = ContentScale.FillWidth,
-                                    )
-                                    CropOverlay(
-                                        modifier = Modifier.matchParentSize(),
-                                        imageWidth = selected.bitmap.width, imageHeight = selected.bitmap.height,
-                                        range = (crop.top.toFloat() / plan.height)..(crop.bottom.toFloat() / plan.height),
-                                        minimumRange = 1f / plan.height, fitImage = false, enabled = !busy,
-                                        onRangeChange = { range ->
-                                            val top = (range.start * plan.height).roundToInt().coerceIn(0, plan.height - 1)
-                                            val bottom = (range.endInclusive * plan.height).roundToInt().coerceIn(top + 1, plan.height)
-                                            updateCrop(ManualCrop(top, bottom))
+                            } else if (!seam.skipped) {
+                                val guidesToggle: @Composable () -> Unit = {
+                                    Row(
+                                        modifier = Modifier.heightIn(min = 48.dp).toggleable(
+                                            value = showGuides,
+                                            enabled = !busy,
+                                            role = Role.Switch,
+                                            onValueChange = { showGuides = it },
+                                        ),
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Text(
+                                            "輔助線",
+                                            color = if (busy) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
+                                            style = MaterialTheme.typography.labelMedium,
+                                            maxLines = 1,
+                                        )
+                                        Switch(checked = showGuides, onCheckedChange = null, enabled = !busy)
+                                    }
+                                }
+                                if (narrowTools) {
+                                    SegmentedChoiceRow(
+                                        options = listOf("重疊對照", "拼接結果"),
+                                        selectedIndex = if (previewMode == ManualPreviewMode.Overlap) 0 else 1,
+                                        onSelect = {
+                                            previewMode = if (it == 0) ManualPreviewMode.Overlap else ManualPreviewMode.Composite
                                         },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        enabled = !busy,
+                                    )
+                                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                                        guidesToggle()
+                                    }
+                                } else {
+                                    Row(
+                                        Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        SegmentedChoiceRow(
+                                            options = listOf("重疊對照", "拼接結果"),
+                                            selectedIndex = if (previewMode == ManualPreviewMode.Overlap) 0 else 1,
+                                            onSelect = {
+                                                previewMode = if (it == 0) ManualPreviewMode.Overlap else ManualPreviewMode.Composite
+                                            },
+                                            modifier = Modifier.weight(1f),
+                                            enabled = !busy,
+                                        )
+                                        guidesToggle()
+                                    }
+                                }
+                                Row(
+                                    Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text("微調第 ${seamIndex + 2} 張圖片 (px)", Modifier.weight(1f),
+                                        style = MaterialTheme.typography.labelMedium)
+                                    Text("${seam.shift} px", style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    listOf(-10 to "↑10", -1 to "↑1", 1 to "↓1", 10 to "↓10")
+                                        .forEach { (delta, label) ->
+                                            FilledTonalButton(
+                                                onClick = { plan = plan.withShift(seamIndex, delta) }, enabled = !busy,
+                                                modifier = Modifier.weight(1f).semantics {
+                                                    contentDescription = "第 ${seamIndex + 2} 張圖片${if (delta < 0) "上移" else "下移"} ${abs(delta)} 像素"
+                                                },
+                                                shape = RoundedCornerShape(12.dp),
+                                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp),
+                                            ) {
+                                                Text(
+                                                    label,
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    maxLines = 1,
+                                                    softWrap = false,
+                                                )
+                                            }
+                                        }
+                                }
+                                if (showGuides) {
+                                    Text(
+                                        "綠線：第 ${seamIndex + 1} 張邊界 · 主題色：第 ${seamIndex + 2} 張邊界\n白線：重疊範圍",
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        style = MaterialTheme.typography.labelMedium,
                                     )
                                 }
                             }
                         }
-                        else -> ManualSeamCanvas(
-                            previous = checkNotNull(previous), next = checkNotNull(next),
-                            plan = plan, seamIndex = seamIndex, mode = previewMode,
-                            showGuides = showGuides, onDrag = drag, viewportTop = previewViewTop,
-                            enabled = !busy && previewMode == ManualPreviewMode.Overlap,
-                            modifier = Modifier.fillMaxSize(),
+                    }
+                    SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp))
+                }
+                Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                    Text(
+                        seamError ?: when {
+                            cropMode -> "裁切後，回到對齊位置檢查接合處。"
+                            remaining == 0 -> "所有接縫已確認，可以查看成品。"
+                            else -> "還有 $remaining 處待確認 · 對齊後按下方按鈕"
+                        },
+                        color = if (seamError != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelMedium,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                    )
+                    Button(
+                        onClick = {
+                            if (cropMode) {
+                                cropMode = false
+                                previewMode = ManualPreviewMode.Overlap
+                            } else {
+                                val confirmed = if (seam.skipped || seam.confirmed) plan else plan.confirm(seamIndex)
+                                plan = confirmed
+                                if (confirmed.isReady()) onApply(confirmed)
+                                else nextManualSeamToReview(confirmed, seamIndex)?.let(selectSeam)
+                            }
+                        },
+                        enabled = !busy && (cropMode || seamError == null),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        if (busy) CircularProgressIndicator(Modifier.size(20.dp), color = LocalContentColor.current, strokeWidth = 2.dp)
+                        else Text(
+                            when {
+                                cropMode -> "完成裁切，返回對齊"
+                                plan.isReady() -> "預覽成品"
+                                seam.skipped || seam.confirmed -> "繼續處理下一處"
+                                otherPending != null -> "確認並繼續"
+                                else -> "確認並預覽成品"
+                            },
+                            fontWeight = FontWeight.SemiBold,
                         )
                     }
                 }
-                Text(
-                    when {
-                        seam.skipped -> "略過重複圖片，避免成品出現相同內容。"
-                        cropMode -> "上下捲動查看圖片，拖曳邊界裁切暗色區域。"
-                        previewMode == ManualPreviewMode.Composite -> "檢查接合處的文字與圖案是否連續。"
-                        else -> "上下拖曳預覽，讓兩張圖的重複內容重合。"
-                    },
-                    modifier = Modifier.padding(vertical = 8.dp),
-                    color = Quiet, style = MaterialTheme.typography.bodyMedium,
-                )
-                if (!seam.skipped) {
-                    PrimaryTabRow(selectedTabIndex = if (cropMode) 1 else 0, containerColor = Paper) {
-                        Tab(selected = !cropMode, onClick = { cropMode = false }, enabled = !busy,
-                            text = { Text("對齊位置") })
-                        Tab(selected = cropMode, onClick = { cropMode = true }, enabled = !busy,
-                            text = { Text("裁切邊緣") })
-                    }
-                }
-                Column(
-                    modifier = (if (compact) Modifier else Modifier.weight(1f).verticalScroll(rememberScrollState()))
-                        .padding(top = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    if (!seam.skipped && cropMode) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            CompactChoice("第 ${seamIndex + 1} 張圖片", selectedImage == seamIndex,
-                                { selectedImage = seamIndex }, Modifier.weight(1f), !busy)
-                            CompactChoice("第 ${seamIndex + 2} 張圖片", selectedImage == seamIndex + 1,
-                                { selectedImage = seamIndex + 1 }, Modifier.weight(1f), !busy)
-                        }
-                        ManualCropSlider(crop, plan.height, !busy, updateCrop)
-                        TextButton(
-                            onClick = { plan = plan.resetImage(selectedImage) },
-                            enabled = !busy,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Text("還原這張的裁切與對齊", textAlign = TextAlign.Center)
-                        }
-                    } else if (!seam.skipped) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            CompactChoice("重疊對照", previewMode == ManualPreviewMode.Overlap,
-                                { previewMode = ManualPreviewMode.Overlap }, Modifier.weight(1f), !busy)
-                            CompactChoice("拼接結果", previewMode == ManualPreviewMode.Composite,
-                                { previewMode = ManualPreviewMode.Composite }, Modifier.weight(1f), !busy)
-                        }
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text("微調第 ${seamIndex + 2} 張圖片", color = Ink, modifier = Modifier.weight(1f),
-                                style = MaterialTheme.typography.bodyMedium)
-                            Row(
-                                modifier = Modifier.heightIn(min = 48.dp).toggleable(
-                                    value = showGuides,
-                                    enabled = !busy,
-                                    role = Role.Switch,
-                                    onValueChange = { showGuides = it },
-                                ),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text("輔助線", color = if (busy) Quiet else Ink,
-                                    style = MaterialTheme.typography.labelMedium)
-                                Switch(checked = showGuides, onCheckedChange = null, enabled = !busy)
-                            }
-                        }
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            listOf(-10 to "↑ 10 px", -1 to "↑ 1 px", 1 to "↓ 1 px", 10 to "↓ 10 px")
-                                .forEach { (delta, label) ->
-                                    OutlinedButton(
-                                        onClick = { plan = plan.withShift(seamIndex, delta) }, enabled = !busy,
-                                        modifier = Modifier.weight(1f).height(48.dp).semantics {
-                                            contentDescription = "第 ${seamIndex + 2} 張圖片${if (delta < 0) "上移" else "下移"} ${abs(delta)} 像素"
-                                        },
-                                        shape = RoundedCornerShape(12.dp),
-                                        contentPadding = PaddingValues(horizontal = 2.dp),
-                                    ) { Text(label, fontSize = 12.sp) }
-                                }
-                        }
-                        if (showGuides) {
-                            Text("綠線：第 ${seamIndex + 1} 張邊界 · 主題色：第 ${seamIndex + 2} 張邊界\n白線：重疊範圍", color = Quiet,
-                                style = MaterialTheme.typography.labelMedium)
-                        }
-                    }
-
-                }
-            }
-            Column(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp)) {
-                Text(
-                    seamError ?: when {
-                        cropMode -> "裁切後，回到對齊位置檢查接合處。"
-                        remaining == 0 -> "所有接縫已確認，可以查看成品。"
-                        else -> "還有 $remaining 處待確認 · 對齊後按下方按鈕"
-                    },
-                    color = if (seamError != null) MaterialTheme.colorScheme.primary else Quiet,
-                    style = MaterialTheme.typography.labelMedium,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                )
-                Button(
-                    onClick = {
-                        if (cropMode) {
-                            cropMode = false
-                            previewMode = ManualPreviewMode.Overlap
-                        } else {
-                            val confirmed = if (seam.skipped || seam.confirmed) plan else plan.confirm(seamIndex)
-                            plan = confirmed
-                            if (confirmed.isReady()) onApply(confirmed)
-                            else nextManualSeamToReview(confirmed, seamIndex)?.let(selectSeam)
-                        }
-                    },
-                    enabled = !busy && (cropMode || seamError == null),
-                    modifier = Modifier.fillMaxWidth().height(52.dp),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
-                ) {
-                    if (busy) CircularProgressIndicator(Modifier.size(22.dp), color = Paper, strokeWidth = 2.dp)
-                    else Text(
-                        when {
-                            cropMode -> "完成裁切，返回對齊"
-                            plan.isReady() -> "預覽成品"
-                            seam.skipped || seam.confirmed -> "繼續處理下一處"
-                            otherPending != null -> "確認並繼續"
-                            else -> "確認並預覽成品"
-                        },
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
             }
         }
-        SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).padding(horizontal = 16.dp, vertical = 96.dp))
     }
     if (showResetDialog) {
         AlertDialog(
@@ -1675,9 +1855,9 @@ private fun ManualCropSlider(crop: ManualCrop, height: Int, enabled: Boolean, on
     }
     Column {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("頂部裁掉 ${crop.top} px", Modifier.weight(1f), color = Quiet,
+            Text("頂部裁掉 ${crop.top} px", Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.labelMedium)
-            Text("底部裁掉 ${height - crop.bottom} px", Modifier.weight(1f), color = Quiet,
+            Text("底部裁掉 ${height - crop.bottom} px", Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.labelMedium, textAlign = TextAlign.End)
         }
         RangeSlider(
@@ -1717,35 +1897,31 @@ internal fun adjustedManualCrop(
 }
 
 @Composable
-private fun CompactChoice(
-    label: String,
-    selected: Boolean,
-    onClick: () -> Unit,
+private fun SegmentedChoiceRow(
+    options: List<String>,
+    selectedIndex: Int,
+    onSelect: (Int) -> Unit,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
 ) {
-    val content: @Composable () -> Unit = {
-        Text(label, fontSize = 12.sp, maxLines = 1)
-    }
-    if (selected) {
-        Button(
-            onClick = onClick,
-            enabled = enabled,
-            modifier = modifier.height(48.dp).semantics { stateDescription = if (selected) "已選取" else "未選取" },
-            shape = RoundedCornerShape(8.dp),
-            contentPadding = PaddingValues(horizontal = 8.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = Ink),
-            content = { content() },
-        )
-    } else {
-        OutlinedButton(
-            onClick = onClick,
-            enabled = enabled,
-            modifier = modifier.height(48.dp).semantics { stateDescription = if (selected) "已選取" else "未選取" },
-            shape = RoundedCornerShape(8.dp),
-            contentPadding = PaddingValues(horizontal = 8.dp),
-            content = { content() },
-        )
+    SingleChoiceSegmentedButtonRow(modifier = modifier) {
+        options.forEachIndexed { index, label ->
+            SegmentedButton(
+                selected = index == selectedIndex,
+                onClick = { onSelect(index) },
+                shape = SegmentedButtonDefaults.itemShape(index = index, count = options.size),
+                enabled = enabled,
+                icon = {},
+                label = {
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                },
+            )
+        }
     }
 }
 
@@ -1764,6 +1940,7 @@ private fun ManualSeamCanvas(
 ) {
     var canvasSize by remember(plan.width) { mutableStateOf(IntSize.Zero) }
     val accentColor = MaterialTheme.colorScheme.primary
+    val canvasColor = MaterialTheme.colorScheme.surfaceContainer
     val currentDrag by rememberUpdatedState(onDrag)
     val previewScale = remember(plan.width, canvasSize.width) {
         manualPreviewScale(plan, canvasSize.width)
@@ -1800,7 +1977,7 @@ private fun ManualSeamCanvas(
                 }
             },
     ) {
-        drawRect(Color(0xFF20231E))
+        drawRect(canvasColor)
         val scale = manualPreviewScale(plan, size.width.roundToInt())
         val shift = plan.seams[seamIndex].shift
         val previousCrop = plan.crops[seamIndex]
@@ -1861,14 +2038,20 @@ private fun ManualSeamCanvas(
             }
         }
         if (showGuides) {
-            fun drawGuide(row: Long, color: Color, width: Float = 1.dp.toPx()) {
+            fun drawGuide(row: Long, color: Color, width: Float = 1.5.dp.toPx()) {
                 val y = (row - viewTop) * scale
                 if (y >= -width && y <= size.height + width) {
+                    drawLine(
+                        Color.Black.copy(alpha = 0.65f),
+                        Offset(0f, y),
+                        Offset(size.width, y),
+                        strokeWidth = width + 2.dp.toPx(),
+                    )
                     drawLine(color, Offset(0f, y), Offset(size.width, y), strokeWidth = width)
                 }
             }
-            drawGuide(previousCrop.top.toLong(), Color(0xFF62D6A7))
-            drawGuide(previousCrop.bottom.toLong(), Color(0xFF62D6A7))
+            drawGuide(previousCrop.top.toLong(), Color(0xFF00C853))
+            drawGuide(previousCrop.bottom.toLong(), Color(0xFF00C853))
             drawGuide(nextTop, accentColor)
             drawGuide(nextBottom, accentColor)
             if (overlapEnd > overlapStart) {
@@ -1937,154 +2120,236 @@ private fun PreviewScreen(
     sources: List<java.io.File>,
     canOutput: Boolean,
     busy: Boolean,
-    message: String?,
+    busyAction: String?,
+    statusMessage: String?,
+    outputMessage: String?,
+    onOutputMessageConsumed: () -> Unit,
     manualPlan: ManualStitchPlan?,
     onManual: () -> Unit,
     onSave: (OutputFormat, ClosedFloatingPointRange<Float>) -> Unit,
     onCopy: (OutputFormat, ClosedFloatingPointRange<Float>) -> Unit,
     onDestroy: () -> Unit,
+    onBack: () -> Unit,
+    sourceCount: Int,
 ) {
-    var format by remember(sources.size) { mutableStateOf(OutputFormat.Jpg) }
-    var crop by remember(sources.firstOrNull()?.path) { mutableStateOf(0f..1f) }
-
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().safeDrawingPadding(),
-        contentPadding = PaddingValues(vertical = 20.dp),
-        verticalArrangement = Arrangement.spacedBy(20.dp),
-    ) {
-        item {
-            Box(Modifier.padding(horizontal = 20.dp)) {
-                AppHeader("預覽")
+    var format by rememberSaveable(sources.size) { mutableStateOf(OutputFormat.Jpg) }
+    var crop by rememberSaveable(
+        sources.firstOrNull()?.path,
+        stateSaver = listSaver(
+            save = { listOf(it.start, it.endInclusive) },
+            restore = { it[0]..it[1] },
+        ),
+    ) { mutableStateOf(0f..1f) }
+    var cropMode by rememberSaveable { mutableStateOf(false) }
+    var showOutput by rememberSaveable { mutableStateOf(false) }
+    var outputDimensions by remember(sources.firstOrNull()?.path) { mutableStateOf<Pair<Int, Int>?>(null) }
+    val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    val snackbar = remember { SnackbarHostState() }
+    val isCropped = crop != 0f..1f
+    val back: () -> Unit = {
+        if (!busy) {
+            when {
+                showOutput -> showOutput = false
+                cropMode -> cropMode = false
+                else -> onBack()
             }
         }
-        if (!canOutput) {
-            item {
-                Surface(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
-                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
-                    shape = RoundedCornerShape(10.dp),
-                ) {
-                    Text(
-                        message ?: "目前顯示原始截圖；低信心接縫需手動確認後才能輸出。",
-                        modifier = Modifier.fillMaxWidth().padding(14.dp),
-                        color = MaterialTheme.colorScheme.primary,
-                        style = MaterialTheme.typography.bodyMedium,
-                        textAlign = TextAlign.Center,
-                    )
-                }
-            }
+    }
+    BackHandler(enabled = busy || showOutput || cropMode, onBack = back)
+    LaunchedEffect(statusMessage, canOutput) {
+        if (!busy && canOutput && statusMessage != null && outputMessage == null) {
+            snackbar.currentSnackbarData?.dismiss()
+            snackbar.showSnackbar(statusMessage, withDismissAction = true, duration = SnackbarDuration.Long)
         }
-        if (manualPlan != null && !canOutput) {
-            item {
-                Button(
-                    onClick = onManual,
-                    enabled = !busy,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).height(52.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Ink),
-                    shape = RoundedCornerShape(10.dp),
-                ) { Text("手動調整", fontWeight = FontWeight.SemiBold) }
-            }
+    }
+    LaunchedEffect(outputMessage, busy) {
+        if (!busy && canOutput && outputMessage != null) {
+            snackbar.currentSnackbarData?.dismiss()
+            snackbar.showSnackbar(outputMessage, withDismissAction = true, duration = SnackbarDuration.Long)
+            onOutputMessageConsumed()
         }
-        if (canOutput) {
-            item {
-                Column(Modifier.padding(horizontal = 20.dp)) {
-                    Text("上下裁切", style = MaterialTheme.typography.titleMedium, color = Ink)
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        "拖曳圖片上的上下邊界線調整",
-                        color = Quiet,
-                    )
-                }
-            }
-        }
-        itemsIndexed(sources, key = { _, source -> source.path }) { index, source ->
-            PreviewImage(
-                source = source,
-                index = index,
-                count = sources.size,
-                crop = if (canOutput) crop else 0f..1f,
-                cropEnabled = canOutput && !busy,
-                showCropOverlay = canOutput,
-                onCropChange = { crop = it },
+    }
+    BoxWithConstraints(Modifier.fillMaxSize().safeDrawingPadding()) {
+        val panelMaxHeight = maxHeight * 0.65f
+        Column(Modifier.fillMaxSize()) {
+            AppHeader("成品預覽", onBack = back, enabled = !busy, onDiscard = onDestroy)
+            Text(
+                "$sourceCount 張截圖 · " + if (canOutput) "可以輸出" else "接縫待確認",
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelMedium,
             )
-        }
-        if (canOutput) {
-            item {
-                Column(Modifier.padding(horizontal = 20.dp)) {
-                    if (message != null) {
-                        Text(
-                            message,
-                            color = MaterialTheme.colorScheme.primary,
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                        Spacer(Modifier.height(14.dp))
-                    }
-                    Text("輸出格式", style = MaterialTheme.typography.titleMedium, color = Ink)
-                    Spacer(Modifier.height(10.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FormatButton(
-                            label = "JPG",
-                            detail = "品質 95",
-                            selected = format == OutputFormat.Jpg,
-                            onClick = { format = OutputFormat.Jpg },
-                            modifier = Modifier.weight(1f),
-                        )
-                        FormatButton(
-                            label = "PNG",
-                            detail = "無損",
-                            selected = format == OutputFormat.Png,
-                            onClick = { format = OutputFormat.Png },
-                            modifier = Modifier.weight(1f),
+            if (!canOutput) {
+                Text(
+                    outputMessage ?: statusMessage ?: "請先確認接縫，再輸出長圖。",
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Box(Modifier.fillMaxWidth().weight(1f)) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    itemsIndexed(sources, key = { _, source -> source.path }) { index, source ->
+                        PreviewImage(
+                            source = source,
+                            index = index,
+                            count = sources.size,
+                            crop = if (canOutput) crop else 0f..1f,
+                            cropEnabled = canOutput && cropMode && !busy,
+                            showCropOverlay = canOutput,
+                            onCropChange = { crop = it },
+                            onDimensionsLoaded = if (sources.size == 1) { w, h -> outputDimensions = w to h } else null,
                         )
                     }
-                    if (format == OutputFormat.Png) {
-                        Spacer(Modifier.height(10.dp))
-                        Text("原始尺寸、無損；檔案通常較大。", color = Quiet)
-                    }
-                    Spacer(Modifier.height(28.dp))
-                    Button(
-                        onClick = { onSave(format, crop) },
-                        enabled = !busy,
-                        modifier = Modifier.fillMaxWidth().height(52.dp),
-                        shape = RoundedCornerShape(10.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Ink),
+                }
+                SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).padding(16.dp))
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            if (showOutput && canOutput) {
+                Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
+                    Column(
+                        Modifier.fillMaxWidth().heightIn(max = panelMaxHeight)
+                            .verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 12.dp),
                     ) {
-                        if (busy) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.height(20.dp),
-                                color = Paper,
-                                strokeWidth = 2.dp,
-                            )
-                        } else {
-                            Text("存到相簿", fontWeight = FontWeight.SemiBold)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("輸出圖片", style = MaterialTheme.typography.titleMedium)
+                                outputDimensions?.let { (width, height) ->
+                                    val (top, bottom) = CaptureOutput.cropRows(height, crop)
+                                    Text(
+                                        "$width × ${bottom - top} px" + if (isCropped) " · 已裁切" else "",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                            TextButton(onClick = { showOutput = false }, enabled = !busy) { Text("關閉") }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        SegmentedChoiceRow(
+                            options = listOf("JPG", "PNG"),
+                            selectedIndex = if (format == OutputFormat.Jpg) 0 else 1,
+                            onSelect = { format = if (it == 0) OutputFormat.Jpg else OutputFormat.Png },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !busy,
+                        )
+                        Text(
+                            if (format == OutputFormat.Png) "原始尺寸、無損；檔案通常較大。"
+                            else "原始尺寸、JPG 品質 95；有損壓縮。",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.padding(vertical = 8.dp),
+                        )
+                        Button(
+                            onClick = { showOutput = false; onSave(format, crop) },
+                            enabled = !busy,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("存到相簿") }
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = { showOutput = false; onCopy(format, crop) },
+                            enabled = !busy,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("複製到剪貼簿") }
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "超過 24 小時的暫存會自動清理",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            } else if (cropMode) {
+                BoxWithConstraints(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainerLow)) {
+                    Column(
+                        Modifier.fillMaxWidth().heightIn(max = maxHeight * 0.5f)
+                            .verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("拖曳圖片上下邊界裁切", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                            TextButton(onClick = { crop = 0f..1f }, enabled = !busy && isCropped) { Text("還原") }
+                        }
+                        if (sources.size == 1) {
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                OutlinedButton(
+                                    onClick = { scope.launch { listState.animateScrollToItem(0, 0) } },
+                                    enabled = !busy,
+                                    modifier = Modifier.weight(1f),
+                                ) { Text("捲到頂部") }
+                                OutlinedButton(
+                                    onClick = {
+                                        scope.launch {
+                                            val itemHeight = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.size ?: 0
+                                            val viewportHeight = listState.layoutInfo.viewportSize.height
+                                            listState.animateScrollToItem(
+                                                sources.lastIndex,
+                                                (itemHeight - viewportHeight).coerceAtLeast(0),
+                                            )
+                                        }
+                                    },
+                                    enabled = !busy,
+                                    modifier = Modifier.weight(1f),
+                                ) { Text("捲到底部") }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                        }
+                        Button(onClick = { cropMode = false }, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+                            Text("完成裁切")
                         }
                     }
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedButton(
-                        onClick = { onCopy(format, crop) },
-                        enabled = !busy,
-                        modifier = Modifier.fillMaxWidth().height(48.dp),
-                        shape = RoundedCornerShape(10.dp),
-                    ) { Text("複製到剪貼簿", color = Ink) }
                 }
-            }
-        }
-        if (canOutput && manualPlan != null) {
-            item {
-                OutlinedButton(
-                    onClick = onManual,
-                    enabled = !busy,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).height(48.dp),
-                    shape = RoundedCornerShape(10.dp),
-                ) { Text("重新手動調整", color = Ink) }
-            }
-        }
-        if (!busy) {
-            item {
-                TextButton(
-                    onClick = onDestroy,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).height(48.dp),
-                ) { Text("銷毀、不保存", color = MaterialTheme.colorScheme.primary) }
+            } else {
+                Surface(color = MaterialTheme.colorScheme.surfaceContainerLow) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (canOutput) {
+                            TextButton(onClick = { cropMode = true }, enabled = !busy) {
+                                Text(if (isCropped) "已裁切" else "裁切")
+                            }
+                            if (manualPlan != null) {
+                                TextButton(onClick = onManual, enabled = !busy) { Text("接縫") }
+                            }
+                            Button(onClick = { showOutput = true }, enabled = !busy, modifier = Modifier.weight(1f)) {
+                                if (busy) {
+                                    Row(
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        CircularProgressIndicator(
+                                            Modifier.size(18.dp),
+                                            strokeWidth = 2.dp,
+                                            color = LocalContentColor.current,
+                                        )
+                                        Text(busyAction ?: "處理中…")
+                                    }
+                                } else {
+                                    Text("輸出")
+                                }
+                            }
+                        } else if (manualPlan != null) {
+                            Button(onClick = onManual, enabled = !busy, modifier = Modifier.weight(1f)) {
+                                Text("檢查接縫")
+                            }
+                        } else {
+                            Button(onClick = onBack, enabled = !busy, modifier = Modifier.weight(1f)) {
+                                Text("重新選擇拼接區域")
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2099,30 +2364,37 @@ private fun PreviewImage(
     cropEnabled: Boolean,
     showCropOverlay: Boolean,
     onCropChange: (ClosedFloatingPointRange<Float>) -> Unit,
+    onDimensionsLoaded: ((Int, Int) -> Unit)? = null,
 ) {
     val loaded by produceState<LoadedPreview?>(null, source.path) {
         value = withContext(Dispatchers.IO) { loadPreview(source) }
     }
+    LaunchedEffect(loaded) {
+        loaded?.let { onDimensionsLoaded?.invoke(it.width, it.height) }
+    }
 
     Column {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
             if (count > 1) {
-                Text("第 ${index + 1} 張", style = MaterialTheme.typography.titleMedium, color = Ink)
+                Text("第 ${index + 1} 張", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
             }
             Spacer(Modifier.weight(1f))
             Text(
-                loaded?.let { "${it.width} × ${it.height} px" } ?: "載入中",
+                loaded?.let {
+                    val (top, bottom) = CaptureOutput.cropRows(it.height, crop)
+                    "${it.width} × ${bottom - top} px"
+                } ?: "載入中",
                 style = MaterialTheme.typography.bodyMedium,
-                color = Quiet,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
         Spacer(Modifier.height(8.dp))
         Surface(
-            modifier = Modifier.fillMaxWidth(),
-            color = Color(0xFF20231E),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            color = MaterialTheme.colorScheme.surfaceContainer,
         ) {
             when (val preview = loaded) {
                 null -> Column(
@@ -2132,9 +2404,9 @@ private fun PreviewImage(
                 ) {
                     CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
                     Spacer(Modifier.height(12.dp))
-                    Text("正在載入預覽", color = Quiet)
+                    Text("正在載入預覽", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                else -> Box {
+                else -> Box(Modifier.padding(vertical = 12.dp)) {
                     Image(
                         bitmap = preview.bitmap.asImageBitmap(),
                         contentDescription = if (count == 1) "裁切後預覽圖片"
@@ -2151,6 +2423,7 @@ private fun PreviewImage(
                             minimumRange = 0.02f,
                             fitImage = false,
                             enabled = cropEnabled,
+                            showHandles = cropEnabled,
                             onRangeChange = onCropChange,
                         )
                     }
@@ -2182,70 +2455,51 @@ private fun loadPreview(source: java.io.File): LoadedPreview {
 }
 
 @Composable
-private fun FormatButton(
-    label: String,
-    detail: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val content: @Composable () -> Unit = {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(label, fontWeight = FontWeight.SemiBold)
-            Text(detail, style = MaterialTheme.typography.bodyMedium)
-        }
-    }
-    if (selected) {
-        Button(
-            onClick = onClick,
-            modifier = modifier.height(64.dp),
-            shape = RoundedCornerShape(10.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = Ink),
-            content = { content() },
-        )
-    } else {
-        OutlinedButton(
-            onClick = onClick,
-            modifier = modifier.height(64.dp),
-            shape = RoundedCornerShape(10.dp),
-            content = { content() },
-        )
-    }
-}
-
-@Composable
-private fun FailureScreen(status: CaptureStatus.Failed, onDestroy: () -> Unit) {
+private fun FailureScreen(status: CaptureStatus.Failed, onDestroy: () -> Unit, onBack: () -> Unit) {
     Column(
-        Modifier.fillMaxSize().safeDrawingPadding().padding(20.dp),
+        Modifier.fillMaxSize().safeDrawingPadding(),
     ) {
-        AppHeader("需要處理")
-        Spacer(Modifier.height(48.dp))
-        Column {
-            Text(status.message, style = MaterialTheme.typography.titleMedium, color = Ink)
+        AppHeader("需要處理", onBack = onBack)
+        Column(
+            Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+        ) {
+            Spacer(Modifier.height(12.dp))
+            Text(status.message, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
             if (status.retainedCount > 0) {
                 Spacer(Modifier.height(10.dp))
-                Text("已保留 ${status.retainedCount} 張有效圖片。", color = Quiet)
+                Text("已保留 ${status.retainedCount} 張有效圖片。", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Spacer(Modifier.weight(1f))
+            Button(onClick = onBack, modifier = Modifier.fillMaxWidth()) {
+                Text(when {
+                    status.retainedCount > 0 -> "返回來源檢查"
+                    CaptureSession.directory != null -> "清理暫存並回首頁"
+                    else -> "回首頁"
+                })
+            }
+            if (status.retainedCount > 0) {
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = onDestroy,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("銷毀暫存", color = MaterialTheme.colorScheme.error) }
             }
         }
-        Spacer(Modifier.weight(1f))
-        OutlinedButton(
-            onClick = onDestroy,
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            shape = RoundedCornerShape(10.dp),
-        ) { Text("銷毀暫存", color = MaterialTheme.colorScheme.primary) }
     }
 }
 
 @Composable
 private fun CenterStatus(title: String, body: String) {
     Column(
-        Modifier.fillMaxSize().safeDrawingPadding().padding(20.dp),
+        Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Text(title, style = MaterialTheme.typography.titleMedium, color = Ink)
+        CircularProgressIndicator()
+        Spacer(Modifier.height(16.dp))
+        Text(title, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
         Spacer(Modifier.height(8.dp))
-        Text(body, textAlign = TextAlign.Center, color = Quiet)
+        Text(body, textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -2253,13 +2507,32 @@ private fun CenterStatus(title: String, body: String) {
 private fun AppHeader(
     status: String? = null,
     onThemeClick: (() -> Unit)? = null,
+    onBack: (() -> Unit)? = null,
+    onDiscard: (() -> Unit)? = null,
+    enabled: Boolean = true,
 ) {
+    var showMenu by remember { mutableStateOf(false) }
     Row(
-        Modifier.fillMaxWidth(),
+        Modifier.fillMaxWidth()
+            .heightIn(min = 56.dp)
+            .padding(
+                start = if (onBack != null) 4.dp else 16.dp,
+                end = if (onThemeClick != null || onDiscard != null) 4.dp else 16.dp,
+            ),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text("長截圖", style = MaterialTheme.typography.titleMedium, color = Ink)
+        if (onBack != null) {
+            IconButton(onClick = onBack, enabled = enabled) {
+                Icon(painterResource(R.drawable.ic_arrow_back), contentDescription = "返回")
+            }
+        }
+        Text(
+            status ?: "長截圖",
+            Modifier.weight(1f),
+            style = MaterialTheme.typography.titleLarge,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
         if (onThemeClick != null) {
             IconButton(
                 onClick = onThemeClick,
@@ -2269,50 +2542,22 @@ private fun AppHeader(
                     painter = painterResource(R.drawable.ic_palette),
                     contentDescription = null,
                     modifier = Modifier.size(26.dp),
-                    tint = Ink,
-                )
-            }
-        } else if (status != null) {
-            Surface(
-                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
-                shape = RoundedCornerShape(99.dp),
-            ) {
-                Text(
-                    status,
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.primary,
+                    tint = MaterialTheme.colorScheme.onSurface,
                 )
             }
         }
+        if (onDiscard != null) {
+            Box {
+                IconButton(onClick = { showMenu = true }, enabled = enabled) {
+                    Icon(painterResource(R.drawable.ic_more_horiz), contentDescription = "更多選項")
+                }
+                DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                    DropdownMenuItem(
+                        text = { Text("銷毀、不保存", color = MaterialTheme.colorScheme.error) },
+                        onClick = { showMenu = false; onDiscard() }, enabled = enabled,
+                    )
+                }
+            }
+        }
     }
-}
-
-@Composable
-private fun LongScreenshotTheme(accent: Color, content: @Composable () -> Unit) {
-    MaterialTheme(
-        colorScheme = darkColorScheme(
-            primary = accent,
-            onPrimary = Paper,
-            background = Paper,
-            onBackground = Ink,
-            surface = Paper,
-            onSurface = Ink,
-            surfaceVariant = Color(0xFF20231E),
-            onSurfaceVariant = Quiet,
-            outline = Color(0xFF464942),
-            error = accent,
-        ),
-        typography = Typography(
-            titleLarge = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 20.sp, lineHeight = 26.sp),
-            titleMedium = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 18.sp, lineHeight = 24.sp),
-            bodyLarge = TextStyle(
-                fontSize = 15.sp,
-                lineHeight = 22.sp,
-            ),
-            bodyMedium = TextStyle(fontSize = 14.sp, lineHeight = 20.sp),
-            labelMedium = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 12.sp),
-        ),
-        content = content,
-    )
 }

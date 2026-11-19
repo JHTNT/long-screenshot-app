@@ -18,6 +18,8 @@ sealed interface CaptureStatus {
         val output: File?,
         val message: String,
         val manualPlan: ManualStitchPlan? = null,
+        val outputAction: String? = null,
+        val outputMessage: String? = null,
     ) : CaptureStatus
     data class Manual(
         val count: Int,
@@ -77,6 +79,7 @@ object CaptureSession {
     }
 
     fun destroy(): Boolean {
+        if ((status as? CaptureStatus.Finished)?.outputAction != null) return false
         val target = directory
         val deleted = target == null || !target.exists() || target.deleteRecursively()
         if (deleted) {
@@ -85,6 +88,8 @@ object CaptureSession {
             systemTopInset = 0
             systemBottomInset = 0
             status = CaptureStatus.Idle
+        } else {
+            status = CaptureStatus.Failed("部分暫存刪除失敗，請重試清理。")
         }
         return deleted
     }
